@@ -1058,13 +1058,27 @@ function findAliasEntry(indexed, rawAlias, prevLyric = null, noteNum = null) {
 }
 
 // Resolve voicebank directory with smart matching (case-insensitive, substring, fallback)
+//
+// [FIX] The previous version fell through to `dirs[0]` (an arbitrary voicebank —
+// often the auto-generated formant-synth "Standard Japanese CV" default) whenever
+// `targetName` didn't match anything, even an *exact* name like "Kasane_Teto".
+// That silently served a completely different (and lower quality) voice with a
+// normal 200 OK response, so the client had no way to detect it: this is why a
+// correctly-named voicebank could render as "not Teto's voice" with no error
+// anywhere. Now:
+//   - If the caller explicitly asked for a name and nothing matches, we return
+//     null (-> 404 "voicebank not found") instead of substituting a random one.
+//   - The `dirs[0]` fallback is only used when NO name was requested at all
+//     (targetName is empty/undefined), which is the one case where "just pick
+//     something" is actually the intended behavior.
 function resolveVoicebankPath(targetName) {
   ensureDefaultVoicebanks();
 
   const baseDir = path.join(__dirname, 'temp', 'voicebanks');
+  const hasRequestedName = !!(targetName && String(targetName).trim());
 
   // 1. Direct path check
-  if (targetName) {
+  if (hasRequestedName) {
     const directPath = path.join(baseDir, targetName);
     if (fs.existsSync(directPath)) {
       return { resolvedName: targetName, resolvedPath: directPath };
@@ -1079,13 +1093,13 @@ function resolveVoicebankPath(targetName) {
     if (dirs.length === 0) {
       ensureDefaultVoicebanks();
       const updatedDirs = fs.readdirSync(baseDir, { withFileTypes: true }).filter(i => i.isDirectory()).map(i => i.name);
-      if (updatedDirs.length > 0) {
+      if (!hasRequestedName && updatedDirs.length > 0) {
         return { resolvedName: updatedDirs[0], resolvedPath: path.join(baseDir, updatedDirs[0]) };
       }
       return null;
     }
 
-    if (targetName) {
+    if (hasRequestedName) {
       const lowerTarget = targetName.toLowerCase();
       const ciMatch = dirs.find(d => d.toLowerCase() === lowerTarget);
       if (ciMatch) {
@@ -1094,10 +1108,23 @@ function resolveVoicebankPath(targetName) {
 
       const subMatch = dirs.find(d => d.toLowerCase().includes(lowerTarget) || lowerTarget.includes(d.toLowerCase()));
       if (subMatch) {
+        console.warn(
+          `[VO-SE] resolveVoicebankPath: no exact match for "${targetName}", ` +
+          `using substring match "${subMatch}" instead. Consider renaming to avoid ambiguity.`
+        );
         return { resolvedName: subMatch, resolvedPath: path.join(baseDir, subMatch) };
       }
+
+      // [FIX] previously: `return { resolvedName: dirs[0], ... }` here — silently
+      // substituting an unrelated voicebank. Now we fail loudly instead.
+      console.warn(
+        `[VO-SE] resolveVoicebankPath: requested voicebank "${targetName}" not found ` +
+        `among [${dirs.join(', ')}] — returning 404 instead of substituting another voicebank.`
+      );
+      return null;
     }
 
+    // No name was requested at all -> picking "any" voicebank is reasonable here.
     return { resolvedName: dirs[0], resolvedPath: path.join(baseDir, dirs[0]) };
   } catch (e) {
     return null;
