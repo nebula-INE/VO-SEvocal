@@ -44,8 +44,13 @@ export function bufferToWav(buffer: AudioBuffer): Blob {
 
   while (offset < buffer.length) {
     for (let i = 0; i < numOfChan; i++) {
-      let sample = Math.max(-1, Math.min(1, channels[i][offset]));
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0;
+      const clamped = Math.max(-1, Math.min(1, channels[i][offset]));
+      // [FIX] Previous code was `(0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0`.
+      // The "0.5 +" was applied to the *condition* instead of as a rounding offset on the
+      // value, so the sign branch was wrong for samples in (-0.5, 0), and `| 0` truncates
+      // toward zero instead of rounding — both add avoidable quantization noise.
+      // Correct: pick the branch by the sample's own sign, then round (not truncate).
+      const sample = Math.round(clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF);
       out.setInt16(pos, sample, true);
       pos += 2;
     }
