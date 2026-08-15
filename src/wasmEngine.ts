@@ -18,7 +18,7 @@ async function decodeWavTo44kPcm16(arrayBuf: ArrayBuffer): Promise<Int16Array> {
   const audioCtx = new AudioContextClass();
   try {
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuf.slice(0));
-    
+
     // If already 44100Hz mono/stereo
     if (audioBuffer.sampleRate === 44100) {
       const channelData = audioBuffer.getChannelData(0);
@@ -49,13 +49,13 @@ async function decodeWavTo44kPcm16(arrayBuf: ArrayBuffer): Promise<Int16Array> {
     console.error("Failed to decode audio with AudioContext:", err);
     return new Int16Array(0);
   } finally {
-    try { audioCtx.close(); } catch(e) {}
+    try { audioCtx.close(); } catch (e) {}
   }
 }
 
 export async function loadWasmEngine() {
   if ((window as any).VoseEngineReady) return (window as any).Module;
-  
+
   return new Promise((resolve, reject) => {
     (window as any).Module = {
       onRuntimeInitialized: () => {
@@ -90,6 +90,11 @@ interface RenderEvent {
 /**
  * High-Precision Studio Offline Synthesizer
  * Seamlessly handles Oto.ini alignment, pitch shifting (C4 base), pitch bends, and crossfading
+ *
+ * NOTE: this is a *fallback* path (naive OfflineAudioContext.playbackRate resampling).
+ * It does not preserve formants the way the WASM/WORLD engine does, so large pitch
+ * shifts will sound thin/"chipmunked" here. Fixing why renderWasm() falls back to this
+ * (see the silence check in renderWasm) is the real fix for perceived audio quality.
  */
 async function renderStudioOffline(notes: any[], tempo: number, voicebank: string): Promise<string | null> {
   if (!notes || notes.length === 0) return null;
@@ -104,7 +109,7 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
 
   // Fetch audio buffers and Oto parameters
   const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-  
+
   try {
     for (let idx = 0; idx < sortedNotes.length; idx++) {
       const n = sortedNotes[idx];
@@ -137,8 +142,20 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
 
           const ab = await res.arrayBuffer();
           audioBuf = await audioContext.decodeAudioData(ab);
+        } else {
+          // [FIX] previously silent — you had no way to tell a note was being dropped.
+          console.warn(
+            `[VOSE Fallback] voicebank-sample fetch failed (HTTP ${res.status}) ` +
+            `voicebank="${voicebank}" alias="${lyric}" note#${idx} — this note will be silent.`
+          );
         }
-      } catch (e) {}
+      } catch (e) {
+        // [FIX] previously silent — surface decode/network errors so bad aliases are debuggable.
+        console.warn(
+          `[VOSE Fallback] voicebank-sample fetch/decode error voicebank="${voicebank}" alias="${lyric}" note#${idx}:`,
+          e
+        );
+      }
 
       const noteStartTime = (n.tick / 480) * (60 / tempo);
       const noteDurationSec = (n.length / 480) * (60 / tempo);
@@ -223,7 +240,7 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
     const wavBlob = bufferToWav(renderedBuffer);
     return URL.createObjectURL(wavBlob);
   } finally {
-    try { audioContext.close(); } catch(e) {}
+    try { audioContext.close(); } catch (e) {}
   }
 }
 
@@ -239,11 +256,11 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
 
     // Sort notes by tick
     const sortedNotes = [...rawNotes].sort((a, b) => a.tick - b.tick);
-    
+
     // Build a continuous timeline including rest events
     const timelineEvents: RenderEvent[] = [];
     let currentTick = 0;
-    
+
     for (let i = 0; i < sortedNotes.length; i++) {
       const note = sortedNotes[i];
       if (note.tick > currentTick) {
@@ -279,7 +296,7 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
           length: note.length
         });
       }
-      
+
       currentTick = Math.max(currentTick, note.tick + note.length);
     }
 
@@ -291,15 +308,15 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
         const n = sortedNotes[i];
         const prevLyric = i > 0 ? sortedNotes[i - 1].lyric : '';
         const wavPathKey = `/${encodeURIComponent(n.lyric || 'a')}_${n.id || i}.wav`;
-        
+
         const res = await fetch(
           `/api/py/voicebank-sample?name=${encodeURIComponent(voicebank)}&alias=${encodeURIComponent(n.lyric || '')}&prevLyric=${encodeURIComponent(prevLyric)}&noteNum=${encodeURIComponent(String(n.noteNum || 60))}`
         );
-        
+
         if (res.ok) {
           const arrayBuf = await res.arrayBuffer();
           const pcm16 = await decodeWavTo44kPcm16(arrayBuf);
-          
+
           if (pcm16.length > 0 && Module._load_embedded_resource) {
             const dataPtr = Module._malloc(pcm16.length * 2);
             ptrsToFree.push(dataPtr);
@@ -312,9 +329,21 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
             }
             const phonemePtr = allocateUTF8(Module, wavPathKey);
             ptrsToFree.push(phonemePtr);
-            
+
             Module._load_embedded_resource(phonemePtr, dataPtr, pcm16.length);
+          } else {
+            // [FIX] previously silent — decode failure or missing engine export
+            console.warn(
+              `[VOSE WASM] Could not register sample for alias="${n.lyric}" note#${i} ` +
+              `(decoded ${pcm16.length} samples, _load_embedded_resource=${!!Module._load_embedded_resource}).`
+            );
           }
+        } else {
+          // [FIX] previously silent — surface the HTTP status so an alias mismatch is diagnosable
+          console.warn(
+            `[VOSE WASM] voicebank-sample fetch failed (HTTP ${res.status}) ` +
+            `voicebank="${voicebank}" alias="${n.lyric}" note#${i} — this note will be silent.`
+          );
         }
       }
 
@@ -356,7 +385,7 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
           const pitchCurvePtr = allocateDoubleArray(0.0, pitchLength);
           Module.setValue(offset + 4, pitchCurvePtr, 'i32');
           Module.setValue(offset + 8, pitchLength, 'i32');
-          
+
           Module.setValue(offset + 12, 0, 'i32');
           Module.setValue(offset + 16, 0, 'i32');
           Module.setValue(offset + 20, 0, 'i32');
@@ -413,15 +442,39 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
       } catch (e) {}
 
       if (wavData && wavData.length > 500) {
-        // Validate that audio isn't silence
+        // [FIX] Validate that audio isn't silence.
+        // The old check only scanned bytes 44..5000 (~57ms at 44.1kHz stereo). A UTAU
+        // project that starts with a rest/pickup silence would be scanned as "all zero"
+        // and wrongly discarded, forcing every render down to the lower-fidelity
+        // renderStudioOffline() fallback — which is what actually caused the perceived
+        // "poor audio quality". Now we sample across the *entire* buffer instead.
         let nonZero = 0;
-        for (let k = 44; k < Math.min(wavData.length, 5000); k++) {
-          if (wavData[k] !== 0) nonZero++;
+        const dataStart = 44;
+        const dataLen = wavData.length - dataStart;
+        // sample at most ~20000 points spread across the whole file, so this stays cheap
+        // even for long renders, but a leading silent region can no longer fool it.
+        const step = Math.max(1, Math.floor(dataLen / 20000));
+        for (let k = dataStart; k < wavData.length; k += step) {
+          if (wavData[k] !== 0) {
+            nonZero++;
+            if (nonZero > 10) break;
+          }
         }
+
         if (nonZero > 10) {
           const blob = new Blob([wavData.buffer], { type: 'audio/wav' });
           return URL.createObjectURL(blob);
+        } else {
+          console.warn(
+            "[VOSE WASM] Rendered output is silent across the entire buffer " +
+            "(not just the start) — falling back to renderStudioOffline()."
+          );
         }
+      } else {
+        console.warn(
+          `[VOSE WASM] execute_render produced no usable WAV data (length=${wavData ? wavData.length : 'null'}) — ` +
+          "falling back to renderStudioOffline()."
+        );
       }
     } finally {
       Module._free(notesPtr);
@@ -430,12 +483,10 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
       }
     }
 
-    // High fidelity fallback renderer
+    // Fallback renderer (lower fidelity — see renderStudioOffline() docstring)
     return await renderStudioOffline(rawNotes, tempo, voicebank);
   } catch (err) {
     console.warn("[VOSE WASM] WASM render fallback triggered:", err);
     return await renderStudioOffline(rawNotes, tempo, voicebank);
   }
 }
-
-
