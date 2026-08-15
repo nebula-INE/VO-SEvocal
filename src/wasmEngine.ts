@@ -113,7 +113,8 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
       const isContinuous = prevNote && (n.tick - (prevNote.tick + prevNote.length) <= 240);
       const prevLyric = isContinuous ? prevNote.lyric : undefined;
 
-      let url = `/api/py/voicebank-sample?name=${encodeURIComponent(voicebank)}&alias=${encodeURIComponent(lyric)}`;
+      const pitchMidi = n.noteNum || 60;
+      let url = `/api/py/voicebank-sample?name=${encodeURIComponent(voicebank)}&alias=${encodeURIComponent(lyric)}&noteNum=${encodeURIComponent(String(pitchMidi))}`;
       if (prevLyric) url += `&prevLyric=${encodeURIComponent(prevLyric)}`;
 
       let audioBuf: AudioBuffer | null = null;
@@ -122,6 +123,7 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
       let right_blank = -40;
       let preutterance = 25;
       let overlap = 10;
+      let baseMidi = 60;
 
       try {
         const res = await fetch(url);
@@ -131,6 +133,7 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
           right_blank = parseFloat(res.headers.get('X-Oto-Right-Blank') || '-40');
           preutterance = parseFloat(res.headers.get('X-Oto-Preutterance') || '25');
           overlap = parseFloat(res.headers.get('X-Oto-Overlap') || '10');
+          baseMidi = parseFloat(res.headers.get('X-Sample-Base-Midi') || '60');
 
           const ab = await res.arrayBuffer();
           audioBuf = await audioContext.decodeAudioData(ab);
@@ -139,14 +142,14 @@ async function renderStudioOffline(notes: any[], tempo: number, voicebank: strin
 
       const noteStartTime = (n.tick / 480) * (60 / tempo);
       const noteDurationSec = (n.length / 480) * (60 / tempo);
-      const pitchMidi = n.noteNum || 60;
 
       if (audioBuf) {
         const source = offlineCtx.createBufferSource();
         source.buffer = audioBuf;
 
-        // Base pitch shift: Voicebank samples are C4 (MIDI 60 = 261.63Hz)
-        const baseRate = Math.min(4.0, Math.max(0.25, Math.pow(2, (pitchMidi - 60) / 12)));
+        // Base pitch shift relative to the sample's recorded MIDI pitch
+        const semitoneShift = pitchMidi - baseMidi;
+        const baseRate = Math.min(4.0, Math.max(0.25, Math.pow(2, semitoneShift / 12)));
         source.playbackRate.setValueAtTime(baseRate, noteStartTime);
 
         // Apply pitch bend curve if present
@@ -290,7 +293,7 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
         const wavPathKey = `/${encodeURIComponent(n.lyric || 'a')}_${n.id || i}.wav`;
         
         const res = await fetch(
-          `/api/py/voicebank-sample?name=${encodeURIComponent(voicebank)}&alias=${encodeURIComponent(n.lyric || '')}&prevLyric=${encodeURIComponent(prevLyric)}`
+          `/api/py/voicebank-sample?name=${encodeURIComponent(voicebank)}&alias=${encodeURIComponent(n.lyric || '')}&prevLyric=${encodeURIComponent(prevLyric)}&noteNum=${encodeURIComponent(String(n.noteNum || 60))}`
         );
         
         if (res.ok) {
@@ -300,8 +303,12 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
           if (pcm16.length > 0 && Module._load_embedded_resource) {
             const dataPtr = Module._malloc(pcm16.length * 2);
             ptrsToFree.push(dataPtr);
-            for (let j = 0; j < pcm16.length; j++) {
-              Module.setValue(dataPtr + j * 2, pcm16[j], 'i16');
+            if (Module.HEAP16) {
+              Module.HEAP16.set(pcm16, dataPtr >> 1);
+            } else {
+              for (let j = 0; j < pcm16.length; j++) {
+                Module.setValue(dataPtr + j * 2, pcm16[j], 'i16');
+              }
             }
             const phonemePtr = allocateUTF8(Module, wavPathKey);
             ptrsToFree.push(phonemePtr);
@@ -312,11 +319,27 @@ export async function renderWasm(rawNotes: any[], tempo: number, voicebank: stri
       }
 
       // Helper for allocating double arrays in WASM
-      const allocateDoubleArray = (val: number, length: number) => {
+      const allocateDoubleArray = (val: number | number[], length: number) => {
         const ptr = Module._malloc(length * 8);
         ptrsToFree.push(ptr);
-        for (let j = 0; j < length; j++) {
-          Module.setValue(ptr + j * 8, val, 'double');
+        if (Array.isArray(val)) {
+          if (Module.HEAPF64) {
+            Module.HEAPF64.set(new Float64Array(val), ptr >> 3);
+          } else {
+            for (let j = 0; j < length; j++) {
+              Module.setValue(ptr + j * 8, val[j] || 0.0, 'double');
+            }
+          }
+        } else {
+          if (Module.HEAPF64) {
+            const arr = new Float64Array(length);
+            arr.fill(val);
+            Module.HEAPF64.set(arr, ptr >> 3);
+          } else {
+            for (let j = 0; j < length; j++) {
+              Module.setValue(ptr + j * 8, val, 'double');
+            }
+          }
         }
         return ptr;
       };

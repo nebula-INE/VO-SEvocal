@@ -156,7 +156,12 @@ async function parseOtoIniFull(dirPath) {
           const rest = line.substring(eqIdx + 1);
           const parts = rest.split(',');
 
-          const alias = (parts[0] || filename).trim();
+          let rawAlias = (parts[0] || '').trim();
+          if (!rawAlias) {
+            const baseName = path.basename(filename);
+            rawAlias = baseName.replace(/\.wav$/i, '');
+          }
+          const alias = rawAlias;
           if (!alias) continue;
 
           result.aliasCount++;
@@ -190,6 +195,10 @@ async function parseOtoIniFull(dirPath) {
           }
           if (!result.aliasMap.has(alias)) {
             result.aliasMap.set(alias, entryObj);
+          }
+          const baseNameNoExt = path.basename(filename).replace(/\.wav$/i, '');
+          if (baseNameNoExt && !result.aliasMap.has(baseNameNoExt)) {
+            result.aliasMap.set(baseNameNoExt, entryObj);
           }
 
           // ★重要: 巨大なVCV音源（oto.ini 1本で数千〜1万行）でも
@@ -930,21 +939,34 @@ function getTrailingVowel(rawLyric) {
   return null;
 }
 
-// Helper function to resolve UTAU alias with intelligent fallback (VCV 連続音, plain CV, suffixes)
-function findAliasEntry(indexed, rawAlias, prevLyric = null) {
+function getMidiFromPitchTag(str) {
+  if (!str) return 60;
+  const match = String(str).match(/([A-Ga-g])([#b]?)(\d)/);
+  if (!match) return 60;
+  const noteName = match[1].toUpperCase();
+  const accidental = match[2];
+  const octave = parseInt(match[3], 10);
+  const baseMap = { 'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11 };
+  let noteVal = baseMap[noteName];
+  if (noteVal === undefined) return 60;
+  if (accidental === '#') noteVal += 1;
+  if (accidental === 'b') noteVal -= 1;
+  return (octave + 1) * 12 + noteVal;
+}
+
+// Helper function to resolve UTAU alias with intelligent fallback (VCV 連続音, plain CV, suffixes, pitch matching)
+function findAliasEntry(indexed, rawAlias, prevLyric = null, noteNum = null) {
   if (!indexed || !indexed.aliasMap) return null;
   const aliasMap = indexed.aliasMap;
   const alias = (rawAlias || '').trim();
   if (!alias) return null;
 
-  // Direct match if rawAlias is already an explicit VCV string (e.g. "a か", "- か")
-  if (aliasMap.has(alias)) return aliasMap.get(alias);
-
   const cleanPitch = alias.replace(/_?[A-Ga-g][#b]?[0-9]$/, '').replace(/_[0-9]$/, '').trim();
   const cleanLyric = alias.replace(/^[-aieuon_]\s*/i, '').trim() || alias;
 
-  const candidates = [cleanLyric];
-  if (cleanPitch && cleanPitch !== alias && cleanLyric !== cleanPitch) candidates.push(cleanPitch);
+  const candidates = [alias];
+  if (cleanLyric !== alias) candidates.push(cleanLyric);
+  if (cleanPitch && cleanPitch !== alias && cleanPitch !== cleanLyric) candidates.push(cleanPitch);
 
   const kata = KANA_HIRA_TO_KATA[cleanLyric] || KANA_KATA_TO_HIRA[cleanLyric];
   if (kata && !candidates.includes(kata)) candidates.push(kata);
@@ -954,40 +976,54 @@ function findAliasEntry(indexed, rawAlias, prevLyric = null) {
 
   const prevVowel = getTrailingVowel(prevLyric);
 
-  for (const cand of candidates) {
-    // Helper to search direct match or pitch-suffixed key in aliasMap (e.g. "a か_A3", "a かC4")
-    const matchPrefixOrExact = (prefixStr) => {
-      if (aliasMap.has(prefixStr)) return aliasMap.get(prefixStr);
-      // Try pitch-suffixed keys matching `prefixStr` + suffix
-      const prefLower = prefixStr.toLowerCase();
+  // Helper to search direct match or pitch-suffixed key in aliasMap
+  const matchPrefixOrExact = (prefixStr) => {
+    if (aliasMap.has(prefixStr)) return aliasMap.get(prefixStr);
+
+    const prefLower = prefixStr.toLowerCase();
+    if (noteNum !== null && noteNum !== undefined) {
+      const midi = Math.round(Number(noteNum));
+      let bestEntry = null;
+      let minDiff = 999;
       for (const [key, entry] of aliasMap.entries()) {
         const kLower = key.toLowerCase();
-        if (kLower.startsWith(prefLower + '_') || kLower.startsWith(prefLower + ' ')) {
-          return entry;
+        if (kLower === prefLower || kLower.startsWith(prefLower + '_') || kLower.startsWith(prefLower + ' ')) {
+          const entryMidi = getMidiFromPitchTag(key) || getMidiFromPitchTag(entry.filename);
+          const diff = Math.abs(midi - entryMidi);
+          if (diff < minDiff) {
+            minDiff = diff;
+            bestEntry = entry;
+          }
         }
       }
-      return null;
-    };
+      if (bestEntry) return bestEntry;
+    }
 
-    // 1. If preceding vowel exists, prioritize VCV continuous sound alias (e.g., "a か", "a_か", "aか")
+    for (const [key, entry] of aliasMap.entries()) {
+      const kLower = key.toLowerCase();
+      if (kLower.startsWith(prefLower + '_') || kLower.startsWith(prefLower + ' ')) {
+        return entry;
+      }
+    }
+    return null;
+  };
+
+  for (const cand of candidates) {
     if (prevVowel) {
       let entry = matchPrefixOrExact(`${prevVowel} ${cand}`) ||
                   matchPrefixOrExact(`${prevVowel}_${cand}`) ||
                   matchPrefixOrExact(`${prevVowel}${cand}`);
       if (entry) return entry;
     } else {
-      // 2. If no preceding note / silence, prioritize silence VCV start alias (e.g., "- か", "-_か", "-か")
       let entry = matchPrefixOrExact(`- ${cand}`) ||
                   matchPrefixOrExact(`_${cand}`) ||
                   matchPrefixOrExact(`-${cand}`);
       if (entry) return entry;
     }
 
-    // 3. Plain CV / direct alias match
     let entry = matchPrefixOrExact(cand);
     if (entry) return entry;
 
-    // 4. Try any VCV prefix as fallback
     const VCV_PREFIXES = ['- ', 'a ', 'i ', 'u ', 'e ', 'o ', 'n ', '-', '_ ', '_'];
     for (const p of VCV_PREFIXES) {
       let vcvEntry = matchPrefixOrExact(`${p}${cand}`);
@@ -995,21 +1031,25 @@ function findAliasEntry(indexed, rawAlias, prevLyric = null) {
     }
   }
 
-  // Case-insensitive & substring match against aliasMap
   const candLower = cleanLyric.toLowerCase();
   for (const [key, entry] of aliasMap.entries()) {
     const kLower = key.toLowerCase();
-    if (kLower === candLower || kLower.endsWith(` ${candLower}`) || kLower.startsWith(`${candLower}_`)) {
+    if (kLower === candLower || kLower.endsWith(` ${candLower}`) || kLower.startsWith(`${candLower}_`) || kLower.startsWith(`${candLower} `)) {
       return entry;
     }
   }
 
-  // Vowel Fallback ('あ' / 'a')
+  for (const [key, entry] of aliasMap.entries()) {
+    const baseName = path.basename(entry.filename || '').replace(/\.wav$/i, '').toLowerCase();
+    if (baseName === candLower || baseName.includes(candLower)) {
+      return entry;
+    }
+  }
+
   if (aliasMap.has('あ')) return aliasMap.get('あ');
   if (aliasMap.has('a')) return aliasMap.get('a');
   if (aliasMap.has('- あ')) return aliasMap.get('- あ');
 
-  // Fallback to first valid entry in voicebank
   if (indexed.entries && indexed.entries.length > 0) {
     return indexed.entries[0];
   }
@@ -1096,7 +1136,7 @@ function resolveWavFilePath(dirPath, filename) {
 
 // Stream WAV Audio sample for specific voicebank & alias (Pure Native - Zero Subprocess)
 app.get('/api/py/voicebank-alias-info', async (req, res) => {
-  const { name, alias, prevLyric } = req.query;
+  const { name, alias, prevLyric, noteNum } = req.query;
   if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
 
   const resolved = resolveVoicebankPath(name);
@@ -1107,7 +1147,7 @@ app.get('/api/py/voicebank-alias-info', async (req, res) => {
   const { resolvedName, resolvedPath } = resolved;
   const indexed = await vbRegistry.getOrIndex(resolvedName, resolvedPath);
   
-  let entry = findAliasEntry(indexed, alias, prevLyric);
+  let entry = findAliasEntry(indexed, alias, prevLyric, noteNum);
   
   if (entry) {
     return res.json({ success: true, entry });
@@ -1117,7 +1157,7 @@ app.get('/api/py/voicebank-alias-info', async (req, res) => {
 });
 
 app.get('/api/py/voicebank-sample', async (req, res) => {
-  const { name, alias, prevLyric } = req.query;
+  const { name, alias, prevLyric, noteNum } = req.query;
   if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
 
   const resolved = resolveVoicebankPath(name);
@@ -1127,7 +1167,7 @@ app.get('/api/py/voicebank-sample', async (req, res) => {
 
   const { resolvedName, resolvedPath } = resolved;
   const indexed = await vbRegistry.getOrIndex(resolvedName, resolvedPath);
-  let entry = findAliasEntry(indexed, alias, prevLyric);
+  let entry = findAliasEntry(indexed, alias, prevLyric, noteNum);
   let wavFile = entry ? entry.wav_path : null;
 
   if (wavFile && !fs.existsSync(wavFile) && entry.filename) {
@@ -1159,12 +1199,14 @@ app.get('/api/py/voicebank-sample', async (req, res) => {
   }
 
   if (entry) {
+    const baseMidi = getMidiFromPitchTag(entry.alias) || getMidiFromPitchTag(entry.filename) || 60;
     res.setHeader('X-Oto-Left-Blank', String(entry.left_blank || 0));
     res.setHeader('X-Oto-Fixed-Range', String(entry.fixed_range || 0));
     res.setHeader('X-Oto-Right-Blank', String(entry.right_blank || 0));
     res.setHeader('X-Oto-Preutterance', String(entry.preutterance || 0));
     res.setHeader('X-Oto-Overlap', String(entry.overlap || 0));
     res.setHeader('X-Alias-Matched', encodeURIComponent(entry.alias || alias));
+    res.setHeader('X-Sample-Base-Midi', String(baseMidi));
   }
 
   res.setHeader('Content-Type', 'audio/wav');

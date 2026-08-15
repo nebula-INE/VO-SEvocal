@@ -486,8 +486,8 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [selectedVoicebank, selectedAliasSearch]);
 
-  const fetchAndCacheSample = async (vbName: string, alias: string, prevLyric?: string) => {
-    const cacheKey = `${vbName}:${alias}:${prevLyric || ''}`;
+  const fetchAndCacheSample = async (vbName: string, alias: string, prevLyric?: string, noteNum?: number) => {
+    const cacheKey = `${vbName}:${alias}:${prevLyric || ''}:${noteNum || ''}`;
     if (sampleCacheRef.current.has(cacheKey)) {
       return sampleCacheRef.current.get(cacheKey)!;
     }
@@ -502,6 +502,9 @@ export default function App() {
       if (prevLyric) {
         url += `&prevLyric=${encodeURIComponent(prevLyric)}`;
       }
+      if (noteNum) {
+        url += `&noteNum=${encodeURIComponent(String(noteNum))}`;
+      }
       const res = await fetch(url);
       if (!res.ok) return null;
 
@@ -510,6 +513,7 @@ export default function App() {
       const right_blank = parseFloat(res.headers.get('X-Oto-Right-Blank') || '0');
       const preutterance = parseFloat(res.headers.get('X-Oto-Preutterance') || '0');
       const overlap = parseFloat(res.headers.get('X-Oto-Overlap') || '0');
+      const baseMidi = parseFloat(res.headers.get('X-Sample-Base-Midi') || '60');
 
       const arrayBuf = await res.arrayBuffer();
       const audioBuf = await ctx.decodeAudioData(arrayBuf);
@@ -520,7 +524,8 @@ export default function App() {
         fixed_range,
         right_blank,
         preutterance,
-        overlap
+        overlap,
+        baseMidi
       };
 
       sampleCacheRef.current.set(cacheKey, item);
@@ -554,7 +559,7 @@ export default function App() {
     }
 
     try {
-      const item = await fetchAndCacheSample(vbName, alias, prevLyric);
+      const item = await fetchAndCacheSample(vbName, alias, prevLyric, pitchMidi);
       if (!item) {
         if (isDirectPreview) setPlayingAlias(null);
         return false;
@@ -563,8 +568,10 @@ export default function App() {
       const source = ctx.createBufferSource();
       source.buffer = item.buffer;
 
-      // Pitch shift based on pitchMidi (assume base pitch C4 = 60)
-      const baseRate = Math.min(4.0, Math.max(0.25, Math.pow(2, (pitchMidi - 60) / 12)));
+      // Pitch shift based on pitchMidi and sample base pitch
+      const sampleBase = item.baseMidi || 60;
+      const semitoneShift = pitchMidi - sampleBase;
+      const baseRate = Math.min(4.0, Math.max(0.25, Math.pow(2, semitoneShift / 12)));
       const now = ctx.currentTime;
       const targetNoteTime = startTimeCtx !== undefined ? startTimeCtx : now;
       source.playbackRate.setValueAtTime(baseRate, Math.max(0, targetNoteTime));
