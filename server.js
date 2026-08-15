@@ -954,6 +954,39 @@ function getMidiFromPitchTag(str) {
   return (octave + 1) * 12 + noteVal;
 }
 
+// [FIX] This function was called from resolveVoicebankPath() in two places but was
+// never defined anywhere in server.js, causing a ReferenceError on every single
+// call to resolveVoicebankPath — which meant every /api/py/voicebank-sample,
+// upload, and voicebank-listing request could fail once that code path was hit.
+//
+// Purpose: make sure at least one usable voicebank exists on first run, using the
+// existing createDefaultVoicebank() helper. It only creates something when the
+// voicebanks folder is completely empty, so it won't interfere with (or overwrite)
+// any voicebank you've already uploaded, including custom ones like "Kasane_Teto".
+//
+// Place this function anywhere at the top level of server.js, near
+// createDefaultVoicebank() (it just needs to exist before resolveVoicebankPath()
+// is first *called* — as a `function` declaration it's hoisted within the module,
+// so exact placement above/below resolveVoicebankPath doesn't matter).
+function ensureDefaultVoicebanks() {
+  const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
+  try {
+    fs.mkdirSync(voicebanksDir, { recursive: true });
+
+    const hasAnyVoicebank = fs
+      .readdirSync(voicebanksDir, { withFileTypes: true })
+      .some((entry) => entry.isDirectory());
+
+    if (!hasAnyVoicebank) {
+      console.log('[VO-SE] No voicebanks found — creating default "Official Voice (VCV)".');
+      createDefaultVoicebank('Official Voice (VCV)');
+    }
+  } catch (e) {
+    // Never let this block the caller (resolveVoicebankPath) — just log and move on.
+    console.warn('[VO-SE] ensureDefaultVoicebanks failed:', e && e.message ? e.message : e);
+  }
+}
+
 // Helper function to resolve UTAU alias with intelligent fallback (VCV 連続音, plain CV, suffixes, pitch matching)
 function findAliasEntry(indexed, rawAlias, prevLyric = null, noteNum = null) {
   if (!indexed || !indexed.aliasMap) return null;
