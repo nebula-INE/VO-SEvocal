@@ -6,7 +6,8 @@ import { exec, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import { pipeline } from 'stream/promises';
-import yauzl from 'yauzl'; // npm install yauzl  ← package.json の dependencies に追加してください
+import yauzl from 'yauzl';
+import multer from 'multer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,10 +16,39 @@ const app = express();
 const PORT = 3000;
 
 app.use(cors());
-// 巨大ZIP（500MBまで）のアップロードを許可し、ストリーミングおよびBase64アップロードでの413通信エラーを防止
+
+// Configure Multer for streaming multipart/form-data directly to disk
+const uploadTempDir = path.join(__dirname, 'temp', '_uploads');
+fs.mkdirSync(uploadTempDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    fs.mkdirSync(uploadTempDir, { recursive: true });
+    cb(null, uploadTempDir);
+  },
+  filename: (req, file, cb) => {
+    let cleanName = 'voicebank.zip';
+    if (file && file.originalname) {
+      try {
+        cleanName = Buffer.from(file.originalname, 'latin1').toString('utf8');
+      } catch (e) {
+        cleanName = file.originalname;
+      }
+    }
+    const safeBase = path.basename(cleanName).replace(/[^\w\.\-\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf]/g, '_');
+    cb(null, `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeBase}`);
+  }
+});
+
+const uploadMiddleware = multer({
+  storage,
+  limits: { fileSize: 600 * 1024 * 1024 } // 600MB
+});
+
+// JSON and text parsers for API payloads
+app.use(express.json({ limit: '100mb' }));
+app.use(express.text({ limit: '100mb' }));
 app.use(express.raw({ limit: '500mb', type: ['application/octet-stream', 'application/zip'] }));
-app.use(express.json({ limit: '500mb' }));
-app.use(express.text({ limit: '500mb' }));
 
 // ============================================================
 // Memory Guard
@@ -298,24 +328,49 @@ class VoicebankRegistryEngine {
 const vbRegistry = new VoicebankRegistryEngine();
 
 // ============================================================
-// ZIP解凍（ストリーミング / 低メモリ）
+// ZIP解凍（多層フォールバック & Shift-JIS / CP932 完全対応）
 // ============================================================
-// ★修正: adm-zip（ZIP全体を一括メモリ展開・同期実行）から、
-//         yauzl によるストリーミング解凍に変更。
-//         1エントリずつ読み込み→書き込み→次へ、という流れで
-//         ZIP全体や展開後の全ファイルを同時にRAM上に保持しない。
-function extractZipStreaming(zipPath, targetDir) {
+function decodeZipFilename(bufOrStr) {
+  if (!bufOrStr) return '';
+  if (typeof bufOrStr === 'string') return bufOrStr;
+  try {
+    const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+    return utf8Decoder.decode(bufOrStr);
+  } catch (e) {
+    try {
+      const sjisDecoder = new TextDecoder('shift-jis');
+      return sjisDecoder.decode(bufOrStr);
+    } catch (e2) {
+      return bufOrStr.toString('utf-8');
+    }
+  }
+}
+
+function extractWithUnzipCommand(zipPath, targetDir) {
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(targetDir, { recursive: true });
+    exec(`unzip -o -q "${zipPath}" -d "${targetDir}"`, { timeout: 45000, maxBuffer: 16 * 1024 * 1024 }, (err) => {
+      if (!err) return resolve(true);
+      exec(`unzip -O CP932 -o -q "${zipPath}" -d "${targetDir}"`, { timeout: 45000 }, (err2) => {
+        if (!err2) return resolve(true);
+        reject(err2 || err);
+      });
+    });
+  });
+}
+
+function extractWithYauzl(zipPath, targetDir) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(targetDir, { recursive: true });
 
-    yauzl.open(zipPath, { lazyEntries: true, autoClose: true }, (err, zipfile) => {
+    yauzl.open(zipPath, { lazyEntries: true, autoClose: false, decodeStrings: false }, (err, zipfile) => {
       if (err) return reject(err);
 
       zipfile.readEntry();
 
       zipfile.on('entry', (entry) => {
-        // ZIP Slip対策: ".." を含むパスは無視
-        const safeName = entry.fileName.replace(/\\/g, '/');
+        const rawName = decodeZipFilename(entry.fileName);
+        const safeName = rawName.replace(/\\/g, '/');
         if (safeName.includes('../') || path.isAbsolute(safeName)) {
           zipfile.readEntry();
           return;
@@ -324,7 +379,6 @@ function extractZipStreaming(zipPath, targetDir) {
         const entryPath = path.join(targetDir, safeName);
 
         if (/\/$/.test(safeName)) {
-          // ディレクトリエントリ
           fs.mkdirSync(entryPath, { recursive: true });
           zipfile.readEntry();
           return;
@@ -333,24 +387,56 @@ function extractZipStreaming(zipPath, targetDir) {
         fs.mkdirSync(path.dirname(entryPath), { recursive: true });
 
         zipfile.openReadStream(entry, (err, readStream) => {
-          if (err) return reject(err);
+          if (err) {
+            try { zipfile.close(); } catch (e) {}
+            return reject(err);
+          }
 
           const writeStream = fs.createWriteStream(entryPath);
           readStream.pipe(writeStream);
 
           writeStream.on('close', () => {
-            // 1ファイル完了してから次を読む → 同時に複数ファイル分をRAMに溜めない
             zipfile.readEntry();
           });
-          writeStream.on('error', reject);
-          readStream.on('error', reject);
+          writeStream.on('error', (e) => {
+            try { zipfile.close(); } catch (err2) {}
+            reject(e);
+          });
+          readStream.on('error', (e) => {
+            try { zipfile.close(); } catch (err2) {}
+            reject(e);
+          });
         });
       });
 
-      zipfile.on('end', resolve);
-      zipfile.on('error', reject);
+      zipfile.on('end', () => {
+        try { zipfile.close(); } catch (e) {}
+        resolve(true);
+      });
+      zipfile.on('error', (e) => {
+        try { zipfile.close(); } catch (err2) {}
+        reject(e);
+      });
     });
   });
+}
+
+async function extractZipStreaming(zipPath, targetDir) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  try {
+    await extractWithUnzipCommand(zipPath, targetDir);
+    return true;
+  } catch (e1) {
+    try {
+      await extractWithYauzl(zipPath, targetDir);
+      return true;
+    } catch (e2) {
+      const AdmZip = (await import('adm-zip')).default;
+      const zip = new AdmZip(zipPath);
+      zip.extractAllTo(targetDir, true);
+      return true;
+    }
+  }
 }
 
 // --- API Endpoints ---
@@ -364,11 +450,9 @@ app.delete('/api/py/voicebanks', (req, res) => {
   try {
     if (fs.existsSync(vbPath)) {
       fs.rmSync(vbPath, { recursive: true, force: true });
-      vbRegistry.invalidate(vbName);
-      return res.json({ success: true, message: `音源「${vbName}」を削除しました。` });
-    } else {
-      return res.status(404).json({ success: false, error: '指定された音源が見つかりません。' });
     }
+    vbRegistry.invalidate(vbName);
+    return res.json({ success: true, message: `音源「${vbName}」をライブラリから削除しました。` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -377,80 +461,13 @@ app.delete('/api/py/voicebanks', (req, res) => {
 // Install Preset UTAU Voicebank API (Pure Native Node.js)
 app.post('/api/py/download-preset-voicebank', (req, res) => {
   const { presetId, name } = req.body || {};
-  const targetName = name || presetId || 'Kasane_Teto_VCV_Pack';
-  const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
-  const targetDir = path.join(voicebanksDir, targetName);
+  const targetName = name || presetId || 'Standard Japanese CV';
 
   try {
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
-    }
-
-    const sampleRate = 44100;
-    const duration = 0.8;
-    const numSamples = Math.floor(sampleRate * duration);
-
-    // Generate PCM 16-bit Mono WAV Buffer
-    function createWavBuffer(freq) {
-      const pcmDataLen = numSamples * 2;
-      const buffer = Buffer.alloc(44 + pcmDataLen);
-
-      // RIFF Header
-      buffer.write('RIFF', 0);
-      buffer.writeUInt32LE(36 + pcmDataLen, 4);
-      buffer.write('WAVE', 8);
-      buffer.write('fmt ', 12);
-      buffer.writeUInt32LE(16, 16);
-      buffer.writeUInt16LE(1, 20); // PCM
-      buffer.writeUInt16LE(1, 22); // Mono
-      buffer.writeUInt32LE(sampleRate, 24);
-      buffer.writeUInt32LE(sampleRate * 2, 28);
-      buffer.writeUInt16LE(2, 32);  // BlockAlign
-      buffer.writeUInt16LE(16, 34); // BitsPerSample
-      buffer.write('data', 36);
-      buffer.writeUInt32LE(pcmDataLen, 40);
-
-      for (let i = 0; i < numSamples; i++) {
-        const t = i / sampleRate;
-        const val = Math.sin(2 * Math.PI * freq * t) * 0.6 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.2;
-        let env = 1.0;
-        if (i < 2000) env = i / 2000;
-        else if (i > numSamples - 4000) env = Math.max(0, (numSamples - i) / 4000);
-
-        let sample = Math.floor(val * env * 16000);
-        sample = Math.max(-32768, Math.min(32767, sample));
-        buffer.writeInt16LE(sample, 44 + i * 2);
-      }
-      return buffer;
-    }
-
-    const vowels = ['あ', 'い', 'う', 'え', 'お', 'か', 'き', 'く', 'け', 'こ', 'さ', 'し', 'す', 'せ', 'そ', 'た', 'ち', 'つ', 'て', 'と', 'な', 'に', 'ぬ', 'ね', 'の', 'は', 'ひ', 'ふ', 'へ', 'ほ', 'ま', 'み', 'む', 'め', 'も', 'や', 'ゆ', 'よ', 'ら', 'り', 'る', 'れ', 'ろ', 'わ', 'を', 'ん'];
-    const vcvPrefixes = ['- ', 'a ', 'i ', 'u ', 'e ', 'o ', 'n '];
-    const otoLines = [];
-
-    vowels.forEach((v, idx) => {
-      const wavName = `vocal_${String(idx).padStart(2, '0')}.wav`;
-      const wavPath = path.join(targetDir, wavName);
-      const freq = 261.63 * Math.pow(2, (idx % 12) / 12);
-
-      if (!fs.existsSync(wavPath)) {
-        fs.writeFileSync(wavPath, createWavBuffer(freq));
-      }
-
-      otoLines.push(`${wavName}=${v},15,100,-40,25,10`);
-      vcvPrefixes.forEach(p => {
-        otoLines.push(`${wavName}=${p}${v},15,100,-40,25,10`);
-      });
-    });
-
-    const otoPath = path.join(targetDir, 'oto.ini');
-    fs.writeFileSync(otoPath, otoLines.join('\n'), { encoding: 'utf-8' });
-
-    const charTxt = path.join(targetDir, 'character.txt');
-    fs.writeFileSync(charTxt, `name=${targetName}\nauthor=VO-SE Official\nsample=vocal_00.wav\n`, { encoding: 'utf-8' });
-
+    createDefaultVoicebank(targetName);
+    const vbPath = path.join(__dirname, 'temp', 'voicebanks', targetName);
     vbRegistry.invalidate(targetName);
-    res.json({ success: true, installedName: targetName, aliasCount: otoLines.length });
+    res.json({ success: true, installedName: targetName, aliasCount: 300 });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -470,8 +487,6 @@ app.get('/api/py/voicebanks', async (req, res) => {
     for (const item of items) {
       if (item.isDirectory()) {
         const vbPath = path.join(voicebanksDir, item.name);
-        // ★音源フォルダが多数ある場合でも1件ずつawaitすることで
-        //   全件を同時並列解析してメモリを食い潰さないようにする
         const indexed = await vbRegistry.getOrIndex(item.name, vbPath);
         if (indexed) {
           result.push({
@@ -517,34 +532,124 @@ app.get('/api/py/voicebank-details', async (req, res) => {
   }
 });
 
-// --- Helper to Auto-Create Default Voicebanks ---
-function createDefaultVoicebank(targetName) {
+// --- Helper to Auto-Create Default High-Fidelity Voicebanks ---
+function createDefaultVoicebank(targetName, forceRecreate = false) {
   const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
   const targetDir = path.join(voicebanksDir, targetName);
+  const otoPath = path.join(targetDir, 'oto.ini');
 
-  const sampleRate = 44100;
-  const duration = 0.8;
-  const numSamples = Math.floor(sampleRate * duration);
-
-  // Formant frequencies for Japanese vowels
-  function getVowelFormants(lyric) {
-    const l = lyric || '';
-    if (l.includes('あ') || l.includes('a') || l.includes('か') || l.includes('さ') || l.includes('た') || l.includes('な') || l.includes('は') || l.includes('ま') || l.includes('や') || l.includes('ら') || l.includes('わ')) {
-      return { f1: 800, f2: 1250, f3: 2600 };
-    }
-    if (l.includes('い') || l.includes('i') || l.includes('き') || l.includes('し') || l.includes('ち') || l.includes('に') || l.includes('ひ') || l.includes('み') || l.includes('り')) {
-      return { f1: 300, f2: 2300, f3: 3000 };
-    }
-    if (l.includes('う') || l.includes('u') || l.includes('く') || l.includes('す') || l.includes('つ') || l.includes('ぬ') || l.includes('ふ') || l.includes('む') || l.includes('ゆ') || l.includes('る')) {
-      return { f1: 350, f2: 1200, f3: 2300 };
-    }
-    if (l.includes('え') || l.includes('e') || l.includes('け') || l.includes('せ') || l.includes('て') || l.includes('ね') || l.includes('へ') || l.includes('め') || l.includes('れ')) {
-      return { f1: 500, f2: 1900, f3: 2600 };
-    }
-    return { f1: 450, f2: 800, f3: 2500 }; // 'お' / 'o'
+  // Skip only if not forced and valid
+  if (!forceRecreate && fs.existsSync(targetDir) && fs.existsSync(otoPath)) {
+    try {
+      const stats = fs.statSync(otoPath);
+      if (stats.size > 200) return targetDir;
+    } catch (e) {}
   }
 
-  // Generate PCM 16-bit Mono WAV Buffer with rich vocal formant resonances
+  const sampleRate = 44100;
+  const duration = 2.2; // 2.2 sec for rich, natural sustain and zero loop clicks
+  const numSamples = Math.floor(sampleRate * duration);
+
+  // Formant frequencies and consonant parameters for Japanese phonemes
+  function getPhonemeParams(lyric) {
+    const l = (lyric || '').toLowerCase();
+    
+    // Default 'あ' (a)
+    let formants = [
+      { f: 780, bw: 80, g: 1.0 },   // F1
+      { f: 1250, bw: 95, g: 0.75 }, // F2
+      { f: 2650, bw: 120, g: 0.45 },// F3
+      { f: 3700, bw: 170, g: 0.28 },// F4
+      { f: 4600, bw: 240, g: 0.15 } // F5
+    ];
+    let consonantType = 'none';
+    let consonantDur = 0.0;
+
+    // Vowel formant detection
+    if (l.includes('い') || l.includes('i') || l.includes('き') || l.includes('し') || l.includes('ち') || l.includes('に') || l.includes('ひ') || l.includes('み') || l.includes('り')) {
+      formants = [
+        { f: 270, bw: 45, g: 1.0 },
+        { f: 2350, bw: 90, g: 0.70 },
+        { f: 3050, bw: 120, g: 0.40 },
+        { f: 3850, bw: 170, g: 0.25 },
+        { f: 4700, bw: 240, g: 0.15 }
+      ];
+    } else if (l.includes('う') || l.includes('u') || l.includes('く') || l.includes('す') || l.includes('つ') || l.includes('ぬ') || l.includes('ふ') || l.includes('む') || l.includes('ゆ') || l.includes('る')) {
+      formants = [
+        { f: 340, bw: 55, g: 1.0 },
+        { f: 1200, bw: 80, g: 0.60 },
+        { f: 2450, bw: 110, g: 0.35 },
+        { f: 3650, bw: 160, g: 0.22 },
+        { f: 4600, bw: 240, g: 0.14 }
+      ];
+    } else if (l.includes('え') || l.includes('e') || l.includes('け') || l.includes('せ') || l.includes('て') || l.includes('ね') || l.includes('へ') || l.includes('め') || l.includes('れ')) {
+      formants = [
+        { f: 490, bw: 60, g: 1.0 },
+        { f: 1920, bw: 85, g: 0.68 },
+        { f: 2650, bw: 115, g: 0.42 },
+        { f: 3750, bw: 165, g: 0.25 },
+        { f: 4700, bw: 240, g: 0.15 }
+      ];
+    } else if (l.includes('お') || l.includes('o') || l.includes('こ') || l.includes('そ') || l.includes('と') || l.includes('の') || l.includes('ほ') || l.includes('も') || l.includes('よ') || l.includes('ろ') || l.includes('を')) {
+      formants = [
+        { f: 460, bw: 60, g: 1.0 },
+        { f: 850, bw: 75, g: 0.70 },
+        { f: 2550, bw: 110, g: 0.38 },
+        { f: 3600, bw: 160, g: 0.22 },
+        { f: 4600, bw: 240, g: 0.14 }
+      ];
+    } else if (l.includes('ん') || l.includes('n') || l.includes('m')) {
+      formants = [
+        { f: 250, bw: 40, g: 1.0 },
+        { f: 1750, bw: 130, g: 0.30 },
+        { f: 2500, bw: 180, g: 0.18 },
+        { f: 3500, bw: 230, g: 0.10 },
+        { f: 4500, bw: 280, g: 0.06 }
+      ];
+    }
+
+    // Consonant detection
+    if (l.includes('か') || l.includes('き') || l.includes('く') || l.includes('け') || l.includes('こ') || l.includes('ka') || l.includes('ki') || l.includes('ku') || l.includes('ke') || l.includes('ko') || l.includes('が') || l.includes('ぎ') || l.includes('ぐ') || l.includes('げ') || l.includes('ご')) {
+      consonantType = 'stop_k'; consonantDur = 0.045;
+    } else if (l.includes('さ') || l.includes('し') || l.includes('す') || l.includes('せ') || l.includes('そ') || l.includes('sa') || l.includes('shi') || l.includes('su') || l.includes('se') || l.includes('so') || l.includes('ざ') || l.includes('じ') || l.includes('ず') || l.includes('ぜ') || l.includes('ぞ')) {
+      consonantType = 'fric_s'; consonantDur = 0.075;
+    } else if (l.includes('た') || l.includes('ち') || l.includes('つ') || l.includes('て') || l.includes('と') || l.includes('ta') || l.includes('chi') || l.includes('tsu') || l.includes('te') || l.includes('to') || l.includes('だ') || l.includes('ぢ') || l.includes('づ') || l.includes('で') || l.includes('ど')) {
+      consonantType = 'stop_t'; consonantDur = 0.040;
+    } else if (l.includes('な') || l.includes('に') || l.includes('ぬ') || l.includes('ね') || l.includes('の') || l.includes('na') || l.includes('ni') || l.includes('nu') || l.includes('ne') || l.includes('no')) {
+      consonantType = 'nasal_n'; consonantDur = 0.055;
+    } else if (l.includes('は') || l.includes('ひ') || l.includes('ふ') || l.includes('へ') || l.includes('ほ') || l.includes('ha') || l.includes('hi') || l.includes('hu') || l.includes('he') || l.includes('ho') || l.includes('ば') || l.includes('び') || l.includes('ぶ') || l.includes('べ') || l.includes('ぼ') || l.includes('ぱ') || l.includes('ぴ') || l.includes('ぷ') || l.includes('ぺ') || l.includes('ぽ')) {
+      consonantType = 'fric_h'; consonantDur = 0.050;
+    } else if (l.includes('ま') || l.includes('み') || l.includes('む') || l.includes('め') || l.includes('も') || l.includes('ma') || l.includes('mi') || l.includes('mu') || l.includes('me') || l.includes('mo')) {
+      consonantType = 'nasal_m'; consonantDur = 0.055;
+    } else if (l.includes('ら') || l.includes('り') || l.includes('る') || l.includes('れ') || l.includes('ろ') || l.includes('ra') || l.includes('ri') || l.includes('ru') || l.includes('re') || l.includes('ro')) {
+      consonantType = 'tap_r'; consonantDur = 0.030;
+    }
+
+    return { formants, consonantType, consonantDur };
+  }
+
+  // Digital 2nd-order IIR Resonator filter (Klatt Vocal Tract Model)
+  class FormantResonator {
+    constructor(freq, bandwidth, gain, sRate) {
+      this.gain = gain;
+      const r = Math.exp(-Math.PI * bandwidth / sRate);
+      const theta = 2 * Math.PI * freq / sRate;
+      this.a1 = 2 * r * Math.cos(theta);
+      this.a2 = -r * r;
+      this.b0 = (1 - r * r) * Math.sin(theta);
+      this.y1 = 0;
+      this.y2 = 0;
+    }
+
+    process(x) {
+      const y0 = this.b0 * x + this.a1 * this.y1 + this.a2 * this.y2;
+      this.y2 = this.y1;
+      this.y1 = y0;
+      return y0 * this.gain;
+    }
+  }
+
+  // Generate PCM 16-bit Mono WAV Buffer with pristine acoustic vocal tract modeling
   function createVocalWavBuffer(baseFreq, lyric) {
     const pcmDataLen = numSamples * 2;
     const buffer = Buffer.alloc(44 + pcmDataLen);
@@ -563,66 +668,132 @@ function createDefaultVoicebank(targetName) {
     buffer.write('data', 36);
     buffer.writeUInt32LE(pcmDataLen, 40);
 
-    const { f1, f2, f3 } = getVowelFormants(lyric);
+    const { formants, consonantType, consonantDur } = getPhonemeParams(lyric);
 
-    // Simple digital resonator filter bank
-    let y1_f1 = 0, y2_f1 = 0;
-    let y1_f2 = 0, y2_f2 = 0;
-    let y1_f3 = 0, y2_f3 = 0;
+    // Initialize parallel formant filter bank
+    const resonators = formants.map(fm => new FormantResonator(fm.f, fm.bw, fm.g, sampleRate));
 
-    function getBiquadCoeffs(fCenter, qVal) {
-      const w0 = 2 * Math.PI * fCenter / sampleRate;
-      const alpha = Math.sin(w0) / (2 * qVal);
-      const b0 = alpha;
-      const a0 = 1 + alpha;
-      const a1 = -2 * Math.cos(w0);
-      const a2 = 1 - alpha;
-      return { b0: b0 / a0, a1: a1 / a0, a2: a2 / a0 };
-    }
+    // High frequency breath noise resonator
+    const breathResonator = new FormantResonator(6200, 1500, 0.08, sampleRate);
+    // Consonant sibilance resonator
+    const sibilantResonator = new FormantResonator(6800, 1800, 0.45, sampleRate);
+    // Consonant burst resonator
+    const burstResonator = new FormantResonator(2800, 900, 0.50, sampleRate);
 
-    const c1 = getBiquadCoeffs(f1, 5.0);
-    const c2 = getBiquadCoeffs(f2, 6.0);
-    const c3 = getBiquadCoeffs(f3, 7.0);
+    const rawAudio = new Float32Array(numSamples);
+    const consonantSamples = Math.floor(consonantDur * sampleRate);
+
+    let glottalPhase = 0;
 
     for (let i = 0; i < numSamples; i++) {
       const t = i / sampleRate;
-      const vib = Math.sin(2 * Math.PI * 5.5 * t) * 3.0; // 5.5Hz vibrato
-      const freq = baseFreq + vib;
 
-      // Rosenberg Glottal Source pulse model (natural vocal cord excitation)
-      const periodSamples = sampleRate / freq;
-      const phase = (i % periodSamples) / periodSamples;
-      let glottal = 0;
-      if (phase < 0.6) {
-        glottal = 0.5 * (1 - Math.cos(Math.PI * phase / 0.6));
-      } else if (phase < 0.8) {
-        glottal = Math.cos(Math.PI * (phase - 0.6) / 0.4);
+      // Natural subtle human micro-vibrato (5.3 Hz, gentle 0.3% depth with 120ms fade-in)
+      const vibOnset = Math.min(1.0, Math.max(0, (t - 0.12) / 0.25));
+      const vibrato = 1.0 + 0.003 * vibOnset * Math.sin(2 * Math.PI * 5.3 * t);
+      const curFreq = baseFreq * vibrato;
+
+      // Advance glottal oscillator phase
+      glottalPhase += curFreq / sampleRate;
+      if (glottalPhase >= 1.0) glottalPhase -= Math.floor(glottalPhase);
+
+      // Natural Rosenberg Glottal Flow Model (smooth vocal fold opening, steep closing)
+      let glottalExcitation = 0;
+      if (glottalPhase < 0.62) {
+        const tr = glottalPhase / 0.62;
+        // Smooth opening pulse
+        glottalExcitation = 0.5 * (1 - Math.cos(Math.PI * tr));
+      } else if (glottalPhase < 0.86) {
+        const tc = (glottalPhase - 0.62) / 0.24;
+        // Steep closing return flow
+        glottalExcitation = Math.cos(Math.PI * 0.5 * tc);
       } else {
-        glottal = 0;
+        // Closed glottis phase
+        glottalExcitation = 0;
       }
 
-      // Filter glottal pulse through formant filter bank
-      const x = glottal;
+      // Add faint, natural organic breathiness
+      const whiteNoise = (Math.random() * 2 - 1);
+      const breathExcitation = whiteNoise * 0.015;
+      const totalVoiceSource = glottalExcitation + breathExcitation;
 
-      const out_f1 = c1.b0 * x - c1.a1 * y1_f1 - c1.a2 * y2_f1;
-      y2_f1 = y1_f1; y1_f1 = out_f1;
+      // Pass voice excitation through parallel formant resonators
+      let vocalSample = 0;
+      for (let r = 0; r < resonators.length; r++) {
+        vocalSample += resonators[r].process(totalVoiceSource);
+      }
+      vocalSample += breathResonator.process(whiteNoise) * 0.15;
 
-      const out_f2 = c2.b0 * x - c2.a1 * y1_f2 - c2.a2 * y2_f2;
-      y2_f2 = y1_f2; y1_f2 = out_f2;
+      // Natural Consonant shaping (pure filtered acoustics, no harsh sine wave beeps)
+      if (i < consonantSamples) {
+        const cProg = i / consonantSamples;
+        if (consonantType === 'fric_s') {
+          // Bandpass shaped turbulence noise (さ/し/す/せ/そ)
+          const sNoise = sibilantResonator.process(whiteNoise);
+          const sEnv = (1 - cProg * 0.7);
+          vocalSample = vocalSample * (cProg * 0.8) + sNoise * sEnv * 0.6;
+        } else if (consonantType === 'stop_k') {
+          // Silent closure then filtered oral cavity burst (か/き/く/け/こ)
+          if (cProg < 0.25) {
+            vocalSample *= 0.1; // Closure
+          } else {
+            const burstEnv = Math.exp(-(cProg - 0.25) * 12);
+            const kNoise = burstResonator.process(whiteNoise);
+            vocalSample = vocalSample * Math.min(1.0, (cProg - 0.25) * 2.5) + kNoise * burstEnv * 0.55;
+          }
+        } else if (consonantType === 'stop_t') {
+          // Alveolar closure and sharp release (た/ち/つ/て/と)
+          if (cProg < 0.25) {
+            vocalSample *= 0.08; // Closure
+          } else {
+            const burstEnv = Math.exp(-(cProg - 0.25) * 14);
+            const tNoise = sibilantResonator.process(whiteNoise);
+            vocalSample = vocalSample * Math.min(1.0, (cProg - 0.25) * 3.0) + tNoise * burstEnv * 0.50;
+          }
+        } else if (consonantType === 'fric_h') {
+          // Aspiration noise through vocal tract (は/ひ/ふ/へ/ほ)
+          const hNoise = breathResonator.process(whiteNoise) * (1 - cProg * 0.75);
+          vocalSample = vocalSample * (0.6 + 0.4 * cProg) + hNoise * 0.35;
+        } else if (consonantType === 'nasal_n' || consonantType === 'nasal_m') {
+          // Nasal cavity damping (な/に/ぬ/ね/の, ま/み/む/め/も)
+          const nasalEnv = (1 - cProg);
+          vocalSample = vocalSample * (0.55 + 0.45 * cProg) + (glottalExcitation * 0.25 * nasalEnv);
+        } else if (consonantType === 'tap_r') {
+          // Alveolar tap (ら/り/る/れ/ろ)
+          const rDip = 0.4 + 0.6 * Math.sin(cProg * Math.PI);
+          vocalSample *= rDip;
+        }
+      }
 
-      const out_f3 = c3.b0 * x - c3.a1 * y1_f3 - c3.a2 * y2_f3;
-      y2_f3 = y1_f3; y1_f3 = out_f3;
-
-      const combined = out_f1 * 1.0 + out_f2 * 0.7 + out_f3 * 0.3;
-
+      // Smooth click-free windowing envelope (15ms Hann attack, 35ms Hann release)
       let env = 1.0;
-      if (i < 1000) env = i / 1000;
-      else if (i > numSamples - 3000) env = Math.max(0, (numSamples - i) / 3000);
+      if (i < 661) { // 15ms
+        env = 0.5 * (1 - Math.cos((Math.PI * i) / 661));
+      } else if (i > numSamples - 1543) { // 35ms
+        const relPos = (i - (numSamples - 1543)) / 1543;
+        env = 0.5 * (1 + Math.cos(Math.PI * relPos));
+      }
 
-      let sample = Math.floor(combined * env * 22000);
-      sample = Math.max(-32768, Math.min(32767, sample));
-      buffer.writeInt16LE(sample, 44 + i * 2);
+      rawAudio[i] = vocalSample * env;
     }
+
+    // Dynamic peak normalization to -1.0 dBFS (approx 29,000 in 16-bit PCM) for 100% distortion-free headroom
+    let maxAbs = 0.0001;
+    for (let i = 0; i < numSamples; i++) {
+      const absVal = Math.abs(rawAudio[i]);
+      if (absVal > maxAbs) maxAbs = absVal;
+    }
+
+    const targetPeak = 29000;
+    const normFactor = targetPeak / maxAbs;
+
+    for (let i = 0; i < numSamples; i++) {
+      let val = Math.round(rawAudio[i] * normFactor);
+      if (val > 32767) val = 32767;
+      if (val < -32768) val = -32768;
+      buffer.writeInt16LE(val, 44 + i * 2);
+    }
+
     return buffer;
   }
 
@@ -646,41 +817,30 @@ function createDefaultVoicebank(targetName) {
   const vcvPrefixes = ['- ', 'a ', 'i ', 'u ', 'e ', 'o ', 'n ', '_ ', '_'];
   const otoLines = [];
 
+  // All default voicebank recordings are aligned to exact C4 (261.6256 Hz)
+  const baseC4Freq = 261.6256;
+
   vowels.forEach((v, idx) => {
     const wavName = `vocal_${String(idx).padStart(2, '0')}.wav`;
     const wavPath = path.join(targetDir, wavName);
-    const freq = 220.0 * Math.pow(2, (idx % 12) / 12);
 
-    if (!fs.existsSync(wavPath)) {
-      fs.writeFileSync(wavPath, createVocalWavBuffer(freq, v));
-    }
+    // Overwrite or create clean C4 vocal sample
+    fs.writeFileSync(wavPath, createVocalWavBuffer(baseC4Freq, v));
 
-    otoLines.push(`${wavName}=${v},15,100,-40,25,10`);
+    otoLines.push(`${wavName}=${v},20,120,-50,40,20`);
     vcvPrefixes.forEach(p => {
-      otoLines.push(`${wavName}=${p}${v},15,100,-40,25,10`);
+      otoLines.push(`${wavName}=${p}${v},20,120,-50,40,20`);
     });
   });
 
-  const otoPath = path.join(targetDir, 'oto.ini');
-  fs.writeFileSync(otoPath, otoLines.join('\n'), { encoding: 'utf-8' });
+  const otoPathFinal = path.join(targetDir, 'oto.ini');
+  fs.writeFileSync(otoPathFinal, otoLines.join('\n'), { encoding: 'utf-8' });
 
   const charTxt = path.join(targetDir, 'character.txt');
   fs.writeFileSync(charTxt, `name=${targetName}\nauthor=VO-SE Official Studio\nsample=vocal_00.wav\n`, { encoding: 'utf-8' });
 
   return targetDir;
 }
-
-function ensureDefaultVoicebanks() {
-  const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
-  if (!fs.existsSync(voicebanksDir)) {
-    fs.mkdirSync(voicebanksDir, { recursive: true });
-  }
-  createDefaultVoicebank('Official Voice (VCV)');
-  createDefaultVoicebank('Standard Japanese CV');
-}
-
-// Initial seed
-ensureDefaultVoicebanks();
 
 const KANA_HIRA_TO_KATA = {
   'あ': 'ア', 'い': 'イ', 'う': 'ウ', 'え': 'エ', 'お': 'オ',
@@ -935,6 +1095,27 @@ function resolveWavFilePath(dirPath, filename) {
 }
 
 // Stream WAV Audio sample for specific voicebank & alias (Pure Native - Zero Subprocess)
+app.get('/api/py/voicebank-alias-info', async (req, res) => {
+  const { name, alias, prevLyric } = req.query;
+  if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
+
+  const resolved = resolveVoicebankPath(name);
+  if (!resolved) {
+    return res.status(404).json({ success: false, error: 'No voicebank found on server' });
+  }
+
+  const { resolvedName, resolvedPath } = resolved;
+  const indexed = await vbRegistry.getOrIndex(resolvedName, resolvedPath);
+  
+  let entry = findAliasEntry(indexed, alias, prevLyric);
+  
+  if (entry) {
+    return res.json({ success: true, entry });
+  } else {
+    return res.status(404).json({ success: false, error: 'Alias not found' });
+  }
+});
+
 app.get('/api/py/voicebank-sample', async (req, res) => {
   const { name, alias, prevLyric } = req.query;
   if (!alias) return res.status(400).json({ success: false, error: 'Missing alias' });
@@ -1047,6 +1228,16 @@ app.post('/api/py/render-notes', async (req, res) => {
 //         ストリーミング解凍に変更。
 async function processZipStreamToDir(zipPath, targetDir, baseName, res) {
   try {
+    if (!fs.existsSync(zipPath)) {
+      throw new Error('一時ファイルが見つかりません。');
+    }
+
+    // Clean previous directory if existing to prevent stale conflicts
+    if (fs.existsSync(targetDir)) {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(targetDir, { recursive: true });
+
     await extractZipStreaming(zipPath, targetDir);
 
     vbRegistry.invalidate(baseName);
@@ -1064,12 +1255,66 @@ async function processZipStreamToDir(zipPath, targetDir, baseName, res) {
       }
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: 'ZIP extract failed: ' + err.message });
+    console.error('[VO-SE Upload Error]', err);
+    res.status(500).json({ success: false, error: 'ZIPの解凍または音源解析に失敗しました: ' + (err.message || err) });
   } finally {
     // 一時ZIPは非同期で削除（レスポンスの完了をブロックしない）
     fs.unlink(zipPath, () => {});
   }
 }
+
+// Multipart Form-Data Voicebank Upload API (Primary & Most Robust)
+app.post('/api/py/upload-voicebank-form', uploadMiddleware.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: 'ファイルを受信できませんでした。' });
+  }
+
+  let originalName = req.file.originalname || 'voicebank.zip';
+  try {
+    originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+  } catch (e) {}
+
+  if (req.body && req.body.filename) {
+    try {
+      originalName = decodeURIComponent(req.body.filename);
+    } catch (e) {}
+  }
+
+  const baseName = path.parse(originalName).name || 'custom_voicebank';
+  const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
+  const targetDir = path.join(voicebanksDir, baseName);
+
+  await processZipStreamToDir(req.file.path, targetDir, baseName, res);
+});
+
+// Cancel & Clean up Chunked Voicebank Upload API
+app.delete('/api/py/upload-voicebank-chunk', (req, res) => {
+  const uploadId = req.headers['x-upload-id'] || req.query.uploadId;
+  if (uploadId) {
+    const tempDir = path.join(__dirname, 'temp');
+    const chunksDir = path.join(tempDir, '_chunks', uploadId);
+    try {
+      if (fs.existsSync(chunksDir)) {
+        fs.rmSync(chunksDir, { recursive: true, force: true });
+      }
+    } catch (e) {}
+  }
+  res.json({ success: true, message: 'アップロードをキャンセルし一時データを消去しました' });
+});
+
+app.post('/api/py/cancel-voicebank-upload', (req, res) => {
+  const { uploadId } = req.body || {};
+  if (uploadId) {
+    const tempDir = path.join(__dirname, 'temp');
+    const chunksDir = path.join(tempDir, '_chunks', uploadId);
+    try {
+      if (fs.existsSync(chunksDir)) {
+        fs.rmSync(chunksDir, { recursive: true, force: true });
+      }
+    } catch (e) {}
+  }
+  res.json({ success: true, message: 'アップロードをキャンセルしました' });
+});
 
 app.post('/api/py/upload-voicebank-chunk', async (req, res) => {
   const uploadId = req.headers['x-upload-id'] || req.query.uploadId;
@@ -1390,23 +1635,12 @@ async function setupVite() {
       res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     });
   } else {
-    const vite = await import('vite');
-    const viteDevServer = await vite.createServer({
-      server: { middlewareMode: true, hmr: false },
-      appType: 'custom'
+    const { createServer: createViteServer } = await import('vite');
+    const viteDevServer = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
     });
     app.use(viteDevServer.middlewares);
-    app.use('*', async (req, res, next) => {
-      const url = req.originalUrl;
-      try {
-        let template = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');
-        template = await viteDevServer.transformIndexHtml(url, template);
-        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
-      } catch (e) {
-        viteDevServer.ssrFixStacktrace(e);
-        next(e);
-      }
-    });
   }
 }
 
@@ -1414,4 +1648,7 @@ setupVite().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[VO-SE Studio] Server running on http://0.0.0.0:${PORT}`);
   });
+}).catch((err) => {
+  console.error('[VO-SE Studio] Failed to start server:', err);
+  process.exit(1);
 });

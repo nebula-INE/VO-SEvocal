@@ -378,9 +378,28 @@ static int64_t note_samples_safe(int p) {
 
 std::shared_ptr<const EmbeddedVoice> find_voice_ref(const char* key)
 {
-    VoseUniqueLock lock(g_voice_db_mutex);
-    auto it = g_voice_db.find(key ? key : "");
-    return (it != g_voice_db.end()) ? it->second : nullptr;
+    {
+        VoseUniqueLock lock(g_voice_db_mutex);
+        auto it = g_voice_db.find(key ? key : "");
+        if (it != g_voice_db.end()) return it->second;
+    }
+    
+    // Fallback: load from disk (MEMFS)
+    if (key) {
+        int audio_len = GetAudioLength(key);
+        if (audio_len > 0) {
+            auto ev = std::make_shared<EmbeddedVoice>();
+            ev->path = key;
+            int nbit = 0;
+            ev->waveform.resize(audio_len);
+            wavread(key, &ev->fs, &nbit, ev->waveform.data());
+            
+            VoseUniqueLock lock(g_voice_db_mutex);
+            g_voice_db[key] = ev;
+            return ev;
+        }
+    }
+    return nullptr;
 }
 
 // ============================================================

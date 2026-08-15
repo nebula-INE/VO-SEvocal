@@ -6,6 +6,7 @@ import {
   Activity, Zap, X, Library, DownloadCloud, HardDrive, Check, Search, FolderPlus, Star, ShieldAlert
 } from 'lucide-react';
 import { bufferToWav } from './utils/audioEncoder';
+import { parsePitchBend } from './utils/pitchCurve';
 import { renderWasm } from './wasmEngine';
 import PitchCurveOverlay from './components/PitchCurveOverlay';
 import PitchCurveMiniEditor from './components/PitchCurveMiniEditor';
@@ -83,7 +84,7 @@ export default function App() {
       id: 'track_1',
       name: 'Vocal 1',
       type: 'vocal',
-      voicebank: 'Official Voice (VCV)',
+      voicebank: '',
       notes: INITIAL_NOTES,
       volume: 0.8,
       isMuted: false,
@@ -157,7 +158,7 @@ export default function App() {
   const playbackRef = useRef<number | null>(null);
 
   // Voicebank State
-  const selectedVoicebank = currentTrack?.voicebank || 'Official Voice (VCV)';
+  const selectedVoicebank = currentTrack?.voicebank || '';
   const setSelectedVoicebank = (vb: string) => {
     setTracks(prev => prev.map(t => t.id === currentTrackId ? { ...t, voicebank: vb } : t));
   };
@@ -188,6 +189,14 @@ export default function App() {
   const [selectedAliasSearch, setSelectedAliasSearch] = useState<string>('');
   const [selectedOtoEntry, setSelectedOtoEntry] = useState<any | null>(null);
 
+  // Upload Cancellation & Input Refs
+  const uploadAbortControllerRef = useRef<AbortController | null>(null);
+  const uploadXhrRef = useRef<XMLHttpRequest | null>(null);
+  const currentUploadIdRef = useRef<string | null>(null);
+  const isUploadCancelledRef = useRef<boolean>(false);
+  const fileInputRef1 = useRef<HTMLInputElement | null>(null);
+  const fileInputRef2 = useRef<HTMLInputElement | null>(null);
+
   // Toast Notification State
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; title: string; desc: string } | null>(null);
 
@@ -216,6 +225,20 @@ export default function App() {
   const handleEngineRender = async () => {
     if (tracks.length === 0) return;
     
+    const targetVb = currentTrack.voicebank || selectedVoicebank || (customVoicebanks.length > 0 ? customVoicebanks[0].name : '');
+    if (!targetVb) {
+      setToast({
+        type: 'error',
+        title: '音源が未設定です',
+        desc: 'UTAU音源が登録されていません。右上の「UTAU音源(.zip) 追加」から音源ZIPをアップロードしてください。'
+      });
+      return;
+    }
+
+    if (!currentTrack.voicebank && targetVb) {
+      setSelectedVoicebank(targetVb);
+    }
+
     setIsRenderingWav(true);
     setToast({
       type: 'info',
@@ -224,7 +247,7 @@ export default function App() {
     });
     
     try {
-      const audioUrl = await renderWasm(currentTrack.notes, tempo, currentTrack.voicebank || 'Official Voice (VCV)');
+      const audioUrl = await renderWasm(currentTrack.notes, tempo, targetVb);
       
       if (audioUrl) {
         setToast({
@@ -286,8 +309,12 @@ export default function App() {
   };
 
   const deleteVoicebank = async (vbName: string) => {
-    if (!window.confirm(`本当に音源「${vbName}」をライブラリから削除しますか？`)) return;
     try {
+      setToast({
+        type: 'info',
+        title: '音源削除中...',
+        desc: `「${vbName}」をライブラリから削除しています...`
+      });
       const res = await fetch(`/api/py/voicebanks?name=${encodeURIComponent(vbName)}`, {
         method: 'DELETE'
       });
@@ -300,7 +327,8 @@ export default function App() {
         });
         await fetchVoicebanks();
         if (selectedVoicebank === vbName) {
-          setSelectedVoicebank('Official Voice (VCV)');
+          const remaining = customVoicebanks.filter(v => v.name !== vbName);
+          setSelectedVoicebank(remaining.length > 0 ? remaining[0].name : '');
         }
       } else {
         throw new Error(data.error || '削除失敗');
@@ -327,11 +355,17 @@ export default function App() {
   const activeAudioNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const triggeredNotesSetRef = useRef<Set<string>>(new Set());
 
-  // Fetch status and voicebanks on mount
+  // Fetch status and voicebanks on mount and when opening voicebanks tab
   useEffect(() => {
     fetchPyStatus();
     fetchVoicebanks();
   }, []);
+
+  useEffect(() => {
+    if (activeTab === 'voicebanks') {
+      fetchVoicebanks();
+    }
+  }, [activeTab]);
 
   // Clear sample cache and preload samples when selected voicebank changes or notes update
   useEffect(() => {
@@ -399,8 +433,19 @@ export default function App() {
     try {
       const res = await fetch('/api/py/voicebanks');
       const data = await res.json();
-      if (data.success && data.voicebanks) {
+      if (data.success && Array.isArray(data.voicebanks)) {
         setCustomVoicebanks(data.voicebanks);
+        if (data.voicebanks.length > 0) {
+          // If current track has no voicebank or invalid one, auto-select the first available one
+          setTracks(prev => prev.map(t => {
+            if (!t.voicebank || !data.voicebanks.some((v: any) => v.name === t.voicebank)) {
+              return { ...t, voicebank: data.voicebanks[0].name };
+            }
+            return t;
+          }));
+        } else {
+          setTracks(prev => prev.map(t => ({ ...t, voicebank: '' })));
+        }
       }
     } catch (e) {
       console.warn('Failed to load voicebanks:', e);
@@ -408,7 +453,7 @@ export default function App() {
   };
 
   const fetchVoicebankDetails = async (vbName: string, query: string = '') => {
-    if (!vbName || vbName.includes('Official') || vbName.includes('Standard') || vbName.includes('BigVGAN')) {
+    if (!vbName) {
       setSelectedVbDetails(null);
       return;
     }
@@ -521,17 +566,19 @@ export default function App() {
       // Pitch shift based on pitchMidi (assume base pitch C4 = 60)
       const baseRate = Math.min(4.0, Math.max(0.25, Math.pow(2, (pitchMidi - 60) / 12)));
       const now = ctx.currentTime;
-      source.playbackRate.setValueAtTime(baseRate, now);
+      const targetNoteTime = startTimeCtx !== undefined ? startTimeCtx : now;
+      source.playbackRate.setValueAtTime(baseRate, Math.max(0, targetNoteTime));
 
       // Pitch bend curve (PBS / PBW / PBY) integration
-      if (pbs && pbw) {
+      if (pbs && pbw && pby) {
         try {
-          const pbwParts = pbw.split(',').map((v) => parseFloat(v) || 0);
-          if (pbwParts.length > 0 && pbwParts[0] > 0) {
-            const bendDurSec = (pbwParts[0] / 1000);
-            const targetRate = baseRate * 1.05; // Gentle pitch bend warmth
-            source.playbackRate.linearRampToValueAtTime(targetRate, now + Math.min(bendDurSec, durationSec * 0.5));
-            source.playbackRate.linearRampToValueAtTime(baseRate, now + Math.min(bendDurSec * 2, durationSec));
+          const points = parsePitchBend(pbs, pbw, pby);
+          for (const pt of points) {
+            const ptTime = targetNoteTime + pt.offsetMs / 1000;
+            const ptRate = baseRate * Math.pow(2, pt.semitone / 12);
+            if (ptTime >= 0 && ptTime <= targetNoteTime + durationSec + 0.1) {
+              source.playbackRate.linearRampToValueAtTime(ptRate, ptTime);
+            }
           }
         } catch (e) {}
       }
@@ -582,22 +629,29 @@ export default function App() {
       }
 
       const gain = ctx.createGain();
-      const volGain = Math.max(0.05, Math.min(1.5, (intensity || 120) / 120)) * 0.9;
+      const volGain = Math.max(0.05, Math.min(1.5, (intensity || 120) / 120)) * 0.92;
 
       if (isDirectPreview) {
-        gain.gain.setValueAtTime(0.001, actualStartTime);
-        gain.gain.linearRampToValueAtTime(volGain, actualStartTime + 0.01);
+        gain.gain.setValueAtTime(0.0001, actualStartTime);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.01, volGain), actualStartTime + 0.01);
         gain.gain.setValueAtTime(volGain, actualStartTime + Math.max(0.01, playLen - 0.02));
-        gain.gain.linearRampToValueAtTime(0.001, actualStartTime + playLen);
+        gain.gain.exponentialRampToValueAtTime(0.0001, actualStartTime + playLen);
       } else {
         const targetNoteTime = startTimeCtx !== undefined ? startTimeCtx : now;
-        gain.gain.setValueAtTime(0.001, actualStartTime);
-        gain.gain.linearRampToValueAtTime(volGain, Math.max(actualStartTime + 0.005, targetNoteTime));
-        gain.gain.setValueAtTime(volGain, Math.max(targetNoteTime + 0.01, targetNoteTime + durationSec - 0.02));
-        gain.gain.linearRampToValueAtTime(0.001, targetNoteTime + durationSec + 0.02);
+        gain.gain.setValueAtTime(0.0001, actualStartTime);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.01, volGain), Math.max(actualStartTime + 0.006, targetNoteTime));
+        gain.gain.setValueAtTime(volGain, Math.max(targetNoteTime + 0.01, targetNoteTime + durationSec - 0.015));
+        gain.gain.exponentialRampToValueAtTime(0.0001, targetNoteTime + durationSec + 0.02);
       }
 
-      source.connect(gain);
+      // Studio High-pass filter (80Hz) to prevent sub-rumble and preserve vocal clarity
+      const hpf = ctx.createBiquadFilter();
+      hpf.type = 'highpass';
+      hpf.frequency.setValueAtTime(80, actualStartTime);
+      hpf.Q.setValueAtTime(0.707, actualStartTime);
+
+      source.connect(hpf);
+      hpf.connect(gain);
       gain.connect(ctx.destination);
 
       activeAudioNodesRef.current.add(source);
@@ -606,6 +660,7 @@ export default function App() {
         if (isDirectPreview) setPlayingAlias(null);
         try {
           source.disconnect();
+          hpf.disconnect();
           gain.disconnect();
         } catch (e) {}
       };
@@ -637,153 +692,243 @@ export default function App() {
     });
   };
 
+  const handleCancelVoicebankUpload = () => {
+    if (!isUploadingVb && !uploadAbortControllerRef.current && !uploadXhrRef.current) return;
+    isUploadCancelledRef.current = true;
+
+    // Abort Fetch / Chunks
+    if (uploadAbortControllerRef.current) {
+      try {
+        uploadAbortControllerRef.current.abort();
+      } catch (e) {}
+      uploadAbortControllerRef.current = null;
+    }
+
+    // Abort XHR
+    if (uploadXhrRef.current) {
+      try {
+        uploadXhrRef.current.abort();
+      } catch (e) {}
+      uploadXhrRef.current = null;
+    }
+
+    // Notify server to clean up partial chunks
+    const uploadId = currentUploadIdRef.current;
+    if (uploadId) {
+      fetch(`/api/py/upload-voicebank-chunk?uploadId=${encodeURIComponent(uploadId)}`, {
+        method: 'DELETE'
+      }).catch(() => {});
+      currentUploadIdRef.current = null;
+    }
+
+    setIsUploadingVb(false);
+    setUploadProgress(0);
+
+    if (fileInputRef1.current) fileInputRef1.current.value = '';
+    if (fileInputRef2.current) fileInputRef2.current.value = '';
+
+    setToast({
+      type: 'info',
+      title: 'アップロードをキャンセルしました',
+      desc: '音源の送信・解析処理を中断しました。'
+    });
+  };
+
   const handleVoicebankZipUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    if (!file.name.toLowerCase().endsWith('.zip')) {
+    const lowerName = file.name.toLowerCase();
+    if (lowerName.endsWith('.html') || lowerName.endsWith('.htm')) {
       setToast({
         type: 'error',
-        title: '形式エラー',
-        desc: 'UTAU音源は .zip 形式の圧縮ファイルを指定してください。'
+        title: 'HTMLファイルです',
+        desc: '選択されたファイルはWebページ（HTML）です。音源配布サイトから直接ZIP圧縮ファイル（.zip）をダウンロードして指定してください。'
       });
+      if (event.target) event.target.value = '';
       return;
     }
 
-    // ★追加: Base64フォールバック経路に落ちた場合の安全上限。
-    //         あまりに大きいファイルをbase64化するとタブのメモリ上限
-    //         (iPad Safariは特に厳しい)を超えてクラッシュしうるため、
-    //         明確にエラーとして案内する。
-    const BASE64_FALLBACK_MAX_BYTES = 150 * 1024 * 1024; // 150MB
+    if (lowerName.endsWith('.rar') || lowerName.endsWith('.7z')) {
+      setToast({
+        type: 'error',
+        title: '非対応の圧縮形式',
+        desc: '.rar や .7z は非対応です。ZIP形式（.zip）の音源ファイルを指定してください。'
+      });
+      if (event.target) event.target.value = '';
+      return;
+    }
+
+    isUploadCancelledRef.current = false;
+    const abortController = new AbortController();
+    uploadAbortControllerRef.current = abortController;
 
     setIsUploadingVb(true);
     setUploadProgress(5);
     setToast({
       type: 'info',
-      title: '音源アップロード・解析中 (5%)',
-      desc: `「${file.name}」を転送および解凍・パースしています...`
+      title: '音源アップロード開始 (5%)',
+      desc: `「${file.name}」(${Math.round(file.size / 1024 / 1024)}MB) を送信しています...`
     });
 
     try {
-      // Robust Chunked Upload (2MB per chunk) to eliminate all Nginx/Proxy body limits & Network Errors
-      const uploadInChunks = async (): Promise<any> => {
-        const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-        const uploadId = `up_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      // 1. Primary: Native multipart/form-data with XMLHttpRequest (Rock-solid for large files & accurate progress)
+      const uploadWithFormData = (): Promise<any> => {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          uploadXhrRef.current = xhr;
 
-        let lastServerResult: any = null;
+          const formData = new FormData();
+          formData.append('file', file, file.name);
+          formData.append('filename', encodeURIComponent(file.name));
 
-        for (let i = 0; i < totalChunks; i++) {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(file.size, start + CHUNK_SIZE);
-          const chunkBlob = file.slice(start, end);
+          xhr.open('POST', '/api/py/upload-voicebank-form');
 
-          const pct = Math.round(((i + 1) / totalChunks) * 75); // 0% ~ 75% for chunk transfer
-          setUploadProgress(pct);
-          setToast({
-            type: 'info',
-            title: `音源アップロード中 (${pct}%)`,
-            desc: `ブロック送信中 [${i + 1}/${totalChunks}]: ${Math.round(end / 1024 / 1024)}MB / ${Math.round(file.size / 1024 / 1024)}MB`
-          });
-
-          const res = await fetch(
-            `/api/py/upload-voicebank-chunk?uploadId=${uploadId}&chunkIndex=${i}&totalChunks=${totalChunks}&filename=${encodeURIComponent(file.name)}`,
-            {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/octet-stream',
-                'X-Upload-Id': uploadId,
-                'X-Chunk-Index': String(i),
-                'X-Total-Chunks': String(totalChunks),
-                'X-Filename': encodeURIComponent(file.name)
-              },
-              body: chunkBlob
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable && !isUploadCancelledRef.current) {
+              const pct = Math.min(85, Math.round((e.loaded / e.total) * 85));
+              setUploadProgress(pct);
+              const loadedMb = (e.loaded / (1024 * 1024)).toFixed(1);
+              const totalMb = (e.total / (1024 * 1024)).toFixed(1);
+              if (e.loaded >= e.total) {
+                setUploadProgress(88);
+                setToast({
+                  type: 'info',
+                  title: '音源解凍・原音設定解析中 (88%)',
+                  desc: 'ファイル送信完了。サーバーでZIPの展開およびoto.iniの解析を行っています...'
+                });
+              } else {
+                setToast({
+                  type: 'info',
+                  title: `音源送信中 (${pct}%)`,
+                  desc: `[${loadedMb}MB / ${totalMb}MB] データを転送しています...`
+                });
+              }
             }
-          );
+          };
 
-          if (!res.ok) {
-            const errJson = await res.json().catch(() => ({}));
-            throw new Error(errJson.error || `Chunk ${i + 1}/${totalChunks} upload failed (${res.status})`);
-          }
+          xhr.onload = () => {
+            uploadXhrRef.current = null;
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const resJson = JSON.parse(xhr.responseText);
+                resolve(resJson);
+              } catch (err) {
+                reject(new Error('サーバーの応答解析に失敗しました。'));
+              }
+            } else {
+              try {
+                const errJson = JSON.parse(xhr.responseText);
+                reject(new Error(errJson.error || `アップロードエラー (${xhr.status})`));
+              } catch (e) {
+                reject(new Error(`アップロード通信エラー (${xhr.status})`));
+              }
+            }
+          };
 
-          lastServerResult = await res.json();
-        }
+          xhr.onabort = () => {
+            uploadXhrRef.current = null;
+            reject(new Error('UPLOAD_CANCELLED'));
+          };
 
-        // Server performs zip extraction after last chunk
-        setUploadProgress(85);
-        setToast({
-          type: 'info',
-          title: `音源解析・解凍中 (85%)`,
-          desc: `全ブロックの受信が完了しました。サーバーで解凍および音源エイリアスをパース中...`
+          xhr.onerror = () => {
+            uploadXhrRef.current = null;
+            reject(new Error('ネットワーク通信が遮断されました。サーバー接続を確認してください。'));
+          };
+
+          xhr.send(formData);
         });
-
-        return lastServerResult;
       };
 
-      let json = await uploadInChunks().catch((e) => {
-        console.warn('[VO-SE] Chunked upload failed, fallback to single stream:', e?.message || e);
+      let json = await uploadWithFormData().catch((e) => {
+        if (e.message === 'UPLOAD_CANCELLED' || isUploadCancelledRef.current || abortController.signal.aborted) {
+          throw e;
+        }
+        console.warn('[VO-SE] FormData upload failed, attempting chunked fallback:', e?.message || e);
         return null;
       });
 
-      // Fallback 1: Single stream upload
+      // 2. Fallback: Chunked Upload (2MB per chunk) for strict proxy environments
       if (!json || !json.success) {
-        const uploadWithXhr = (): Promise<any> => {
-          return new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', `/api/py/upload-voicebank-stream?filename=${encodeURIComponent(file.name)}`);
-            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-
-            xhr.upload.onprogress = (e) => {
-              if (e.lengthComputable) {
-                const pct = Math.round((e.loaded / e.total) * 75);
-                setUploadProgress(pct);
-              }
-            };
-
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) {
-                try {
-                  resolve(JSON.parse(xhr.responseText));
-                } catch (err) {
-                  reject(new Error('JSON parse error from server'));
-                }
-              } else {
-                reject(new Error(`Server error (${xhr.status})`));
-              }
-            };
-
-            xhr.onerror = () => reject(new Error('ネットワーク通信エラーが発生しました'));
-            xhr.send(file);
-          });
-        };
-
-        json = await uploadWithXhr().catch(() => null);
-      }
-
-      // Fallback 2: Base64 fallback (small files only)
-      if (!json || !json.success) {
-        if (file.size > BASE64_FALLBACK_MAX_BYTES) {
-          throw new Error(
-            `分割通信および単一通信に失敗しました。` +
-            `ファイルサイズ (${Math.round(file.size / 1024 / 1024)}MB) が大きすぎる可能性があります。`
-          );
+        if (isUploadCancelledRef.current || abortController.signal.aborted) {
+          throw new Error('UPLOAD_CANCELLED');
         }
 
-        setUploadProgress(90);
-        setToast({
-          type: 'info',
-          title: '互換モード切替中 (90%)',
-          desc: `代替経路でアップロードを試行しています...`
-        });
+        const uploadInChunks = async (): Promise<any> => {
+          const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+          const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+          const uploadId = `up_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          currentUploadIdRef.current = uploadId;
 
-        const base64Str = await fileToBase64(file);
-        const fbRes = await fetch('/api/py/upload-voicebank', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filename: file.name, fileData: base64Str })
+          let lastServerResult: any = null;
+
+          for (let i = 0; i < totalChunks; i++) {
+            if (isUploadCancelledRef.current || abortController.signal.aborted) {
+              throw new Error('UPLOAD_CANCELLED');
+            }
+
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const chunkBlob = file.slice(start, end);
+
+            const pct = Math.round(((i + 1) / totalChunks) * 80);
+            setUploadProgress(pct);
+            setToast({
+              type: 'info',
+              title: `音源ブロック送信中 (${pct}%)`,
+              desc: `ブロック [${i + 1}/${totalChunks}]: ${Math.round(end / 1024 / 1024)}MB / ${Math.round(file.size / 1024 / 1024)}MB`
+            });
+
+            const res = await fetch(
+              `/api/py/upload-voicebank-chunk?uploadId=${uploadId}&chunkIndex=${i}&totalChunks=${totalChunks}&filename=${encodeURIComponent(file.name)}`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/octet-stream',
+                  'X-Upload-Id': uploadId,
+                  'X-Chunk-Index': String(i),
+                  'X-Total-Chunks': String(totalChunks),
+                  'X-Filename': encodeURIComponent(file.name)
+                },
+                body: chunkBlob,
+                signal: abortController.signal
+              }
+            );
+
+            if (isUploadCancelledRef.current || abortController.signal.aborted) {
+              throw new Error('UPLOAD_CANCELLED');
+            }
+
+            if (!res.ok) {
+              const errJson = await res.json().catch(() => ({}));
+              throw new Error(errJson.error || `ブロック ${i + 1}/${totalChunks} の送信に失敗しました (${res.status})`);
+            }
+
+            lastServerResult = await res.json();
+          }
+
+          if (isUploadCancelledRef.current || abortController.signal.aborted) {
+            throw new Error('UPLOAD_CANCELLED');
+          }
+
+          setUploadProgress(88);
+          setToast({
+            type: 'info',
+            title: `音源解析・解凍中 (88%)`,
+            desc: `全ブロック受信完了。サーバーで解凍および音源エイリアスをパース中...`
+          });
+
+          currentUploadIdRef.current = null;
+          return lastServerResult;
+        };
+
+        json = await uploadInChunks().catch((e) => {
+          if (e.message === 'UPLOAD_CANCELLED' || isUploadCancelledRef.current || abortController.signal.aborted) {
+            throw e;
+          }
+          console.warn('[VO-SE] Chunked upload also failed:', e?.message || e);
+          return null;
         });
-        json = await fbRes.json();
       }
 
       if (json && json.success && json.data) {
@@ -791,29 +936,39 @@ export default function App() {
         setToast({
           type: 'success',
           title: 'UTAU音源の読み込み完了 (100%)！',
-          desc: `「${json.data.name}」を正常ロードしました (解析エイリアス: ${json.data.aliasCount}件)`
+          desc: `「${json.data.name}」を正常ロードしました (登録原音数: ${json.data.aliasCount}件)`
         });
         await fetchVoicebanks();
         setSelectedVoicebank(json.data.name);
+        setTracks(prev => prev.map(t => t.id === currentTrackId ? { ...t, voicebank: json.data.name } : t));
       } else {
         setUploadProgress(0);
         setToast({
           type: 'error',
           title: '音源の読み込み失敗',
-          desc: (json && json.error) || 'ZIP内に valid な oto.ini または音声が見つかりませんでした'
+          desc: (json && json.error) || 'ZIP内に有効な oto.ini または WAV 音声が見つかりませんでした。'
         });
       }
     } catch (err: any) {
-      setUploadProgress(0);
-      setToast({
-        type: 'error',
-        title: '通信エラー',
-        desc: err.message || 'アップロード通信に失敗しました'
-      });
+      if (err.name === 'AbortError' || err.message === 'UPLOAD_CANCELLED' || isUploadCancelledRef.current) {
+        setUploadProgress(0);
+      } else {
+        setUploadProgress(0);
+        setToast({
+          type: 'error',
+          title: '通信エラー',
+          desc: err.message || '音源ZIPの送信・処理中に通信エラーが発生しました。'
+        });
+      }
     } finally {
       setIsUploadingVb(false);
-      setTimeout(() => setUploadProgress(0), 3000);
-      event.target.value = '';
+      uploadAbortControllerRef.current = null;
+      uploadXhrRef.current = null;
+      currentUploadIdRef.current = null;
+      setTimeout(() => {
+        if (!isUploadingVb) setUploadProgress(0);
+      }, 3000);
+      if (event.target) event.target.value = '';
     }
   };
 
@@ -910,138 +1065,27 @@ export default function App() {
       alert('書き出すノートが存在しません。');
       return;
     }
+    const targetVb = selectedVoicebank || (customVoicebanks.length > 0 ? customVoicebanks[0].name : '');
+    if (!targetVb) {
+      alert('UTAU音源が設定されていません。先にUTAU音源(.zip)をアップロードしてください。');
+      return;
+    }
     setIsRenderingWav(true);
     try {
-      const sampleRate = 44100;
-      const maxTick = notes.reduce((max, n) => Math.max(max, n.tick + n.length), 0);
-      const totalDurationSec = Math.max((maxTick / 480) * (60 / tempo) + 1.2, 2.0);
-
-      const offlineCtx = new OfflineAudioContext(2, Math.ceil(sampleRate * totalDurationSec), sampleRate);
-
-      // Pre-fetch sample buffers for all notes in project
-      for (let idx = 0; idx < notes.length; idx++) {
-        const n = notes[idx];
-        const startTime = (n.tick / 480) * (60 / tempo);
-        const durationSec = (n.length / 480) * (60 / tempo);
-        const pitchMidi = n.noteNum;
-        const lyric = n.lyric;
-
-        const prevNote = idx > 0 ? notes[idx - 1] : null;
-        const isContinuous = prevNote && (n.tick - (prevNote.tick + prevNote.length) <= 240);
-        const prevLyric = isContinuous ? prevNote.lyric : undefined;
-
-        const item = await fetchAndCacheSample(selectedVoicebank, lyric, prevLyric);
-        if (item && item.buffer) {
-          const source = offlineCtx.createBufferSource();
-          source.buffer = item.buffer;
-
-          const playbackRate = Math.min(4.0, Math.max(0.25, Math.pow(2, (pitchMidi - 60) / 12)));
-          source.playbackRate.setValueAtTime(playbackRate, startTime);
-
-          const offsetSec = Math.max(0, (item.left_blank || 0) / 1000);
-          const wavDuration = item.buffer.duration;
-
-          let maxSampleDur = Math.max(0.05, wavDuration - offsetSec);
-          const rb = item.right_blank || 0;
-          if (rb < 0) {
-            maxSampleDur = Math.max(0.05, wavDuration - offsetSec - (Math.abs(rb) / 1000));
-          } else if (rb > 0) {
-            maxSampleDur = Math.max(0.05, rb / 1000);
-          }
-
-          const preuttSec = Math.max(0, (item.preutterance || 0) / 1000);
-          const effectivePreuttSec = preuttSec / playbackRate;
-          const actualStartTime = Math.max(0, startTime - effectivePreuttSec);
-          const timeDiff = actualStartTime - (startTime - effectivePreuttSec);
-          const startOffsetInWav = offsetSec + timeDiff * playbackRate;
-          const playLen = effectivePreuttSec + durationSec;
-
-          const requiredSampleSec = (startOffsetInWav - offsetSec) + playLen * playbackRate;
-          if (requiredSampleSec > maxSampleDur + 0.05) {
-            const loopStartSec = offsetSec + Math.max(0.01, (item.fixed_range || item.preutterance || 50) / 1000);
-            const loopEndSec = Math.min(wavDuration - 0.02, offsetSec + maxSampleDur);
-            if (loopEndSec > loopStartSec + 0.04) {
-              source.loop = true;
-              source.loopStart = loopStartSec;
-              source.loopEnd = loopEndSec;
-            }
-          }
-
-          const gain = offlineCtx.createGain();
-          const volGain = Math.max(0.05, Math.min(1.5, (n.intensity || 120) / 120)) * 0.9;
-          gain.gain.setValueAtTime(0.001, actualStartTime);
-          gain.gain.linearRampToValueAtTime(volGain, Math.max(actualStartTime + 0.005, startTime));
-          gain.gain.setValueAtTime(volGain, Math.max(startTime + 0.01, startTime + durationSec - 0.02));
-          gain.gain.linearRampToValueAtTime(0.001, startTime + durationSec + 0.02);
-
-          source.connect(gain);
-          gain.connect(offlineCtx.destination);
-
-          source.start(actualStartTime, startOffsetInWav);
-          source.stop(startTime + durationSec + 0.02);
-        } else {
-          // Warm Vocal Formant Synthesizer Fallback for offline export
-          const freq = 440 * Math.pow(2, (pitchMidi - 69) / 12);
-          let f1 = 500, f2 = 1500, f3 = 2500;
-          if (lyric.includes('あ') || lyric.includes('a') || lyric.includes('か') || lyric.includes('た') || lyric.includes('さ')) {
-            f1 = 800; f2 = 1250; f3 = 2600;
-          } else if (lyric.includes('い') || lyric.includes('i') || lyric.includes('き') || lyric.includes('し')) {
-            f1 = 300; f2 = 2300; f3 = 3000;
-          } else if (lyric.includes('う') || lyric.includes('u') || lyric.includes('く') || lyric.includes('す')) {
-            f1 = 350; f2 = 1200; f3 = 2300;
-          } else if (lyric.includes('え') || lyric.includes('e') || lyric.includes('け') || lyric.includes('せ')) {
-            f1 = 500; f2 = 1900; f3 = 2600;
-          } else if (lyric.includes('お') || lyric.includes('o') || lyric.includes('こ') || lyric.includes('そ')) {
-            f1 = 450; f2 = 800; f3 = 2500;
-          }
-
-          const osc = offlineCtx.createOscillator();
-          osc.type = 'sawtooth';
-          osc.frequency.setValueAtTime(freq, startTime);
-
-          const filter1 = offlineCtx.createBiquadFilter();
-          filter1.type = 'bandpass';
-          filter1.frequency.setValueAtTime(f1, startTime);
-          filter1.Q.setValueAtTime(5, startTime);
-
-          const filter2 = offlineCtx.createBiquadFilter();
-          filter2.type = 'bandpass';
-          filter2.frequency.setValueAtTime(f2, startTime);
-          filter2.Q.setValueAtTime(6, startTime);
-
-          const filter3 = offlineCtx.createBiquadFilter();
-          filter3.type = 'bandpass';
-          filter3.frequency.setValueAtTime(f3, startTime);
-          filter3.Q.setValueAtTime(7, startTime);
-
-          const gain = offlineCtx.createGain();
-          gain.gain.setValueAtTime(0.001, startTime);
-          gain.gain.linearRampToValueAtTime(0.4, startTime + 0.01);
-          gain.gain.setValueAtTime(0.4, startTime + Math.max(0.01, durationSec - 0.02));
-          gain.gain.linearRampToValueAtTime(0.001, startTime + durationSec);
-
-          osc.connect(filter1);
-          osc.connect(filter2);
-          osc.connect(filter3);
-          filter1.connect(gain);
-          filter2.connect(gain);
-          filter3.connect(gain);
-          gain.connect(offlineCtx.destination);
-
-          osc.start(startTime);
-          osc.stop(startTime + durationSec);
-        }
+      const url = await renderWasm(notes, tempo, targetVb);
+      if (url) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${projectName.replace(/\s+/g, '_')}_rendered.wav`;
+        a.click();
+        setToast({
+          type: 'success',
+          title: 'WAV書き出し完了',
+          desc: `${projectName}_rendered.wav を書き出しました。`
+        });
+      } else {
+        throw new Error('音声データの生成に失敗しました。');
       }
-
-      const renderedBuffer = await offlineCtx.startRendering();
-      const wavBlob = bufferToWav(renderedBuffer);
-
-      const url = URL.createObjectURL(wavBlob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${projectName.replace(/\s+/g, '_')}_rendered.wav`;
-      a.click();
-      URL.revokeObjectURL(url);
     } catch (err: any) {
       alert('WAV音声書き出しに失敗しました: ' + err.message);
     } finally {
@@ -1311,7 +1355,7 @@ export default function App() {
           <label className="flex items-center space-x-1.5 text-xs bg-cyan-700 hover:bg-cyan-600 text-white font-medium px-3 py-1.5 rounded-md cursor-pointer transition border border-cyan-600 shadow-sm shadow-cyan-900/30">
             {isUploadingVb ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
             <span>{isUploadingVb ? '音源解凍中...' : 'UTAU音源(.zip) 追加'}</span>
-            <input type="file" accept=".zip" onChange={handleVoicebankZipUpload} disabled={isUploadingVb} className="hidden" />
+            <input type="file" accept=".zip,application/zip,application/x-zip,application/x-zip-compressed,multipart/x-zip,application/octet-stream" onChange={handleVoicebankZipUpload} disabled={isUploadingVb} className="hidden" />
           </label>
 
           <button
@@ -1450,9 +1494,7 @@ export default function App() {
                       onChange={(e) => setSelectedVoicebank(e.target.value)}
                       className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-200 text-xs font-medium"
                     >
-                      <option value="Official Voice (VCV)">Official Voice (VCV 連続音)</option>
-                      <option value="Standard Japanese CV">Standard Japanese CV (単独音)</option>
-                      <option value="BigVGAN Neural Synth">BigVGAN AI Neural Synth</option>
+                      <option value="" disabled>音源を選択...</option>
                       {customVoicebanks.map((vb) => (
                         <option key={vb.name} value={vb.name}>
                           {vb.name} ({vb.aliasCount} エイリアス{vb.hasVcv ? ' / VCV' : ''})
@@ -1484,7 +1526,7 @@ export default function App() {
                     <span className="text-[10px] text-slate-400 font-bold tracking-wider">TRACKS</span>
                     <div className="flex space-x-1">
                       <button 
-                        onClick={() => setTracks(prev => [...prev, { id: `track_${Date.now()}`, name: `Vocal ${prev.length + 1}`, type: 'vocal', voicebank: 'Official Voice (VCV)', notes: [], volume: 0.8, isMuted: false, isSolo: false }])}
+                        onClick={() => setTracks(prev => [...prev, { id: `track_${Date.now()}`, name: `Vocal ${prev.length + 1}`, type: 'vocal', voicebank: '', notes: [], volume: 0.8, isMuted: false, isSolo: false }])}
                         className="text-[9px] bg-slate-800 hover:bg-cyan-900 text-cyan-400 px-1.5 py-0.5 rounded transition"
                       >+ VOCAL</button>
                     </div>
@@ -1878,11 +1920,11 @@ export default function App() {
                       <h2 className="text-xl font-bold text-slate-100 tracking-wide flex items-center space-x-2">
                         <span>UTAU 音源ライブラリ・マネージャー</span>
                         <span className="text-xs font-mono font-normal px-2.5 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800/60">
-                          {3 + customVoicebanks.length} 個の音源が利用可能
+                          {customVoicebanks.length} 個の音源が利用可能
                         </span>
                       </h2>
                       <p className="text-xs text-slate-400 mt-1">
-                        ダウンロード済み音源の一覧・追加・削除・ワンクリックプリセット試聴 & アクティブ選択
+                        ZIP音源の追加・削除・原音設定 (oto.ini) 確認・アクティブ選択
                       </p>
                     </div>
                   </div>
@@ -1916,11 +1958,40 @@ export default function App() {
                     ))}
                   </div>
 
-                  <label className="flex items-center space-x-2 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-semibold px-4 py-2 rounded-lg cursor-pointer transition shadow-lg shadow-cyan-900/40">
-                    {isUploadingVb ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                    <span>{isUploadingVb ? '解凍パース中...' : 'UTAU音源(.zip) 追加'}</span>
-                    <input type="file" accept=".zip" onChange={handleVoicebankZipUpload} disabled={isUploadingVb} className="hidden" />
-                  </label>
+                  <button
+                    onClick={() => {
+                      fetchVoicebanks();
+                      setToast({ type: 'info', title: 'ライブラリ更新', desc: '最新の登録音源状態を取得しました。' });
+                    }}
+                    className="flex items-center space-x-1.5 text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 px-3 py-2 rounded-lg border border-slate-800 transition cursor-pointer"
+                    title="音源ライブラリの最新状態を取得"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>更新</span>
+                  </button>
+
+                  {isUploadingVb ? (
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center space-x-2 text-xs bg-slate-900 border border-cyan-500/50 text-cyan-300 font-semibold px-3 py-2 rounded-lg shadow-sm">
+                        <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
+                        <span>アップロード中 ({uploadProgress}%)</span>
+                      </div>
+                      <button
+                        onClick={handleCancelVoicebankUpload}
+                        className="flex items-center space-x-1.5 text-xs bg-rose-600 hover:bg-rose-500 text-white font-semibold px-3.5 py-2 rounded-lg cursor-pointer transition shadow-md shadow-rose-900/40"
+                        title="アップロードを中断"
+                      >
+                        <X className="w-4 h-4" />
+                        <span>キャンセル</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="flex items-center space-x-2 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-semibold px-4 py-2 rounded-lg cursor-pointer transition shadow-lg shadow-cyan-900/40">
+                      <Upload className="w-4 h-4" />
+                      <span>UTAU音源(.zip) 追加</span>
+                      <input ref={fileInputRef1} type="file" accept=".zip,application/zip,application/x-zip,application/x-zip-compressed,multipart/x-zip,application/octet-stream" onChange={handleVoicebankZipUpload} className="hidden" />
+                    </label>
+                  )}
                 </div>
               </div>
 
@@ -1932,8 +2003,10 @@ export default function App() {
                   </div>
                   <div>
                     <div className="text-[11px] text-slate-400 font-medium">現在選択中のアクティブ音源</div>
-                    <div className="text-sm font-bold text-cyan-300 truncate max-w-[180px]">{selectedVoicebank}</div>
-                    <div className="text-[10px] text-emerald-400 font-mono mt-0.5">● 合成可能・準備完了</div>
+                    <div className="text-sm font-bold text-cyan-300 truncate max-w-[180px]">{selectedVoicebank || '未設定'}</div>
+                    <div className={`text-[10px] font-mono mt-0.5 ${selectedVoicebank ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {selectedVoicebank ? '● 合成可能・準備完了' : '○ 音源ZIPを追加してください'}
+                    </div>
                   </div>
                 </div>
 
@@ -1955,156 +2028,46 @@ export default function App() {
                   <div>
                     <div className="text-[11px] text-slate-400 font-medium">総登録原音・エイリアス数</div>
                     <div className="text-sm font-bold text-amber-300 font-mono">
-                      {customVoicebanks.reduce((acc, v) => acc + (v.aliasCount || 0), 350)} 件
+                      {customVoicebanks.reduce((acc, v) => acc + (v.aliasCount || 0), 0)} 件
                     </div>
                     <div className="text-[10px] text-slate-400 mt-0.5">連続音 (VCV) & 単独音 (CV)</div>
                   </div>
                 </div>
               </div>
 
-              {/* Section 1: Installed & Built-in Voicebanks */}
+              {/* Section 1: Installed Voicebanks */}
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center space-x-2">
                     <HardDrive className="w-4 h-4 text-cyan-400" />
-                    <span>ダウンロード済み・組み込み音源一覧</span>
+                    <span>登録済みUTAU音源一覧</span>
                   </h3>
                   <span className="text-xs text-slate-400 font-mono">
-                    {3 + customVoicebanks.length} 音源登録中
+                    {customVoicebanks.length} 音源登録中
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {/* Built-in Preset 1: Official VCV */}
-                  {vbCategoryFilter !== 'custom' && ('Official Voice (VCV)'.toLowerCase().includes(vbSearchQuery.toLowerCase())) && (
-                    <div
-                      className={`bg-slate-900 rounded-xl border p-4 transition-all flex flex-col justify-between space-y-4 relative ${
-                        selectedVoicebank === 'Official Voice (VCV)'
-                          ? 'border-cyan-500 bg-cyan-950/20 shadow-lg shadow-cyan-500/10'
-                          : 'border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-start justify-between">
-                          <div className="flex items-center space-x-3">
-                            <div className="w-10 h-10 rounded-lg bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center font-bold text-white shadow">
-                              VCV
-                            </div>
-                            <div>
-                              <h4 className="font-bold text-slate-100 text-sm">Official Voice (VCV)</h4>
-                              <p className="text-[11px] text-slate-400">公式標準モデル (連続音対応)</p>
-                            </div>
-                          </div>
-                          {selectedVoicebank === 'Official Voice (VCV)' && (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                              使用中
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] font-mono bg-slate-950 p-2.5 rounded-lg border border-slate-800/80">
-                          <div>
-                            <span className="text-slate-500">タイプ:</span>{' '}
-                            <span className="text-cyan-400 font-semibold">連続音 (VCV)</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">エイリアス:</span>{' '}
-                            <span className="text-slate-200 font-semibold">350+</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">音色:</span>{' '}
-                            <span className="text-slate-300">ナチュラル女性音</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">提供:</span>{' '}
-                            <span className="text-slate-400">VO-SE 内蔵</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 gap-2">
-                        <button
-                          onClick={() => setSelectedVoicebank('Official Voice (VCV)')}
-                          disabled={selectedVoicebank === 'Official Voice (VCV)'}
-                          className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition flex items-center justify-center space-x-1 ${
-                            selectedVoicebank === 'Official Voice (VCV)'
-                              ? 'bg-slate-800 text-slate-500 cursor-default'
-                              : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-md'
-                          }`}
-                        >
-                          <Check className="w-3.5 h-3.5" />
-                          <span>{selectedVoicebank === 'Official Voice (VCV)' ? '選択中' : 'この音源を選択'}</span>
-                        </button>
-                      </div>
+                {customVoicebanks.length === 0 ? (
+                  <div className="bg-slate-900/60 border border-dashed border-slate-800 rounded-2xl p-10 text-center flex flex-col items-center justify-center space-y-4">
+                    <div className="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center text-slate-400">
+                      <HardDrive className="w-8 h-8 text-cyan-400/80" />
                     </div>
-                  )}
-
-                  {/* Built-in Preset 2: Standard CV */}
-                  {vbCategoryFilter !== 'custom' && ('Standard Japanese CV'.toLowerCase().includes(vbSearchQuery.toLowerCase())) && (
-                    <div
-                      className={`bg-slate-900 rounded-xl border p-4 transition-all flex flex-col justify-between space-y-4 relative ${
-                        selectedVoicebank === 'Standard Japanese CV'
-                          ? 'border-cyan-500 bg-cyan-950/20 shadow-lg shadow-cyan-500/10'
-                          : 'border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-start justify-between">
-                          <div className="flex items-center space-x-3">
-                            <div className="w-10 h-10 rounded-lg bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center font-bold text-white shadow">
-                              CV
-                            </div>
-                            <div>
-                              <h4 className="font-bold text-slate-100 text-sm">Standard Japanese CV</h4>
-                              <p className="text-[11px] text-slate-400">標準単独音ライブラリ</p>
-                            </div>
-                          </div>
-                          {selectedVoicebank === 'Standard Japanese CV' && (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800">
-                              使用中
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] font-mono bg-slate-950 p-2.5 rounded-lg border border-slate-800/80">
-                          <div>
-                            <span className="text-slate-500">タイプ:</span>{' '}
-                            <span className="text-indigo-400 font-semibold">単独音 (CV)</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">エイリアス:</span>{' '}
-                            <span className="text-slate-200 font-semibold">120+</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">音色:</span>{' '}
-                            <span className="text-slate-300">クリア単独音</span>
-                          </div>
-                          <div>
-                            <span className="text-slate-500">提供:</span>{' '}
-                            <span className="text-slate-400">VO-SE 内蔵</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 gap-2">
-                        <button
-                          onClick={() => setSelectedVoicebank('Standard Japanese CV')}
-                          disabled={selectedVoicebank === 'Standard Japanese CV'}
-                          className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition flex items-center justify-center space-x-1 ${
-                            selectedVoicebank === 'Standard Japanese CV'
-                              ? 'bg-slate-800 text-slate-500 cursor-default'
-                              : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-md'
-                          }`}
-                        >
-                          <Check className="w-3.5 h-3.5" />
-                          <span>{selectedVoicebank === 'Standard Japanese CV' ? '選択中' : 'この音源を選択'}</span>
-                        </button>
-                      </div>
+                    <div className="max-w-md">
+                      <h4 className="text-base font-bold text-slate-200">音源が登録されていません</h4>
+                      <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
+                        UTAU音源（単独音・連続音・VCV）のZIPファイルをアップロードしてください。自動で展開され、oto.iniの原音設定がインデックスされます。
+                      </p>
                     </div>
-                  )}
-
+                    <label className="flex items-center space-x-2 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-semibold px-5 py-2.5 rounded-xl cursor-pointer transition shadow-lg shadow-cyan-950/50">
+                      <Upload className="w-4 h-4" />
+                      <span>UTAU音源(.zip)をアップロード</span>
+                      <input ref={fileInputRef2} type="file" accept=".zip,application/zip,application/x-zip,application/x-zip-compressed,multipart/x-zip,application/octet-stream" onChange={handleVoicebankZipUpload} className="hidden" />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {/* Custom Installed Voicebanks */}
-                  {vbCategoryFilter !== 'official' && customVoicebanks
+                  {customVoicebanks
                     .filter((vb) => vb.name.toLowerCase().includes(vbSearchQuery.toLowerCase()))
                     .map((vb) => {
                       const isSelected = selectedVoicebank === vb.name;
@@ -2203,7 +2166,8 @@ export default function App() {
                         </div>
                       );
                     })}
-                </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -2222,11 +2186,28 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center space-x-3">
-                  <label className="flex items-center space-x-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-medium px-3.5 py-2 rounded-lg cursor-pointer transition shadow-md shadow-cyan-900/40">
-                    {isUploadingVb ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                    <span>{isUploadingVb ? '音源解凍・解析中...' : 'UTAU音源(.zip) アップロード'}</span>
-                    <input type="file" accept=".zip" onChange={handleVoicebankZipUpload} disabled={isUploadingVb} className="hidden" />
-                  </label>
+                  {isUploadingVb ? (
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center space-x-2 text-xs bg-slate-900 border border-cyan-500/50 text-cyan-300 font-medium px-3 py-2 rounded-lg shadow-sm">
+                        <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
+                        <span>アップロード中 ({uploadProgress}%)</span>
+                      </div>
+                      <button
+                        onClick={handleCancelVoicebankUpload}
+                        className="flex items-center space-x-1 text-xs bg-rose-600 hover:bg-rose-500 text-white font-medium px-3 py-2 rounded-lg cursor-pointer transition shadow-md shadow-rose-900/40"
+                        title="アップロードを中断"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>キャンセル</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="flex items-center space-x-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-medium px-3.5 py-2 rounded-lg cursor-pointer transition shadow-md shadow-cyan-900/40">
+                      <Upload className="w-4 h-4" />
+                      <span>UTAU音源(.zip) アップロード</span>
+                      <input ref={fileInputRef2} type="file" accept=".zip" onChange={handleVoicebankZipUpload} className="hidden" />
+                    </label>
+                  )}
                 </div>
               </div>
 
@@ -2246,9 +2227,7 @@ export default function App() {
                           onChange={(e) => setSelectedVoicebank(e.target.value)}
                           className="bg-slate-950 border border-cyan-800/60 text-cyan-300 font-bold rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-400 shadow-inner"
                         >
-                          <option value="Official Voice (VCV)">Official Voice (VCV 連続音)</option>
-                          <option value="Standard Japanese CV">Standard Japanese CV (単独音)</option>
-                          <option value="BigVGAN Neural Synth">BigVGAN AI Neural Synth</option>
+                          <option value="" disabled>音源を選択...</option>
                           {customVoicebanks.map((vb) => (
                             <option key={vb.name} value={vb.name}>
                               ✅ {vb.name} ({vb.aliasCount} エイリアス{vb.hasVcv ? ' / VCV' : ''})
@@ -2267,7 +2246,7 @@ export default function App() {
                             ? `解析済みエイリアス: ${customVoicebanks.find((v) => v.name === selectedVoicebank)?.aliasCount} 件 (${
                                 customVoicebanks.find((v) => v.name === selectedVoicebank)?.hasVcv ? '連続音対応' : '単独音'
                               })`
-                            : '組み込みデフォルト音源モデル (内蔵)'}
+                            : '音源が選択されていません'}
                         </span>
                         {selectedVbDetails && (
                           <span className="text-[10px] bg-emerald-950 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800/60 font-mono">
@@ -2740,6 +2719,19 @@ export default function App() {
                   }`}
                   style={{ width: `${uploadProgress}%` }}
                 />
+              </div>
+            )}
+
+            {/* Cancel Upload Button inside Active Toast */}
+            {isUploadingVb && (
+              <div className="pt-1 flex justify-end">
+                <button
+                  onClick={handleCancelVoicebankUpload}
+                  className="flex items-center space-x-1.5 text-[11px] font-semibold bg-rose-950/90 hover:bg-rose-900 text-rose-300 hover:text-white border border-rose-700/70 px-2.5 py-1 rounded-md transition shadow-sm"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  <span>アップロードを中止する</span>
+                </button>
               </div>
             )}
           </div>
